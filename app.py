@@ -1,4 +1,3 @@
-
 import io
 from dataclasses import dataclass
 from typing import Literal, Optional
@@ -110,6 +109,34 @@ with col_right:
     st.subheader("PDF 텍스트 토큰 추출 결과 (텍스트 PDF면 이게 잘 나옴)")
     tokens = extract_pdf_text_tokens(pdf_bytes)
     df = tokens_to_dataframe(tokens)
+    
+    
+        # 페이지 전체 목록(렌더링된 페이지 수 기준)
+    all_pages = pd.DataFrame({"page": list(range(1, len(images) + 1))})
+
+    page_counts = (
+        df.groupby("page")
+        .size()
+        .rename("n_tokens")
+        .reset_index()
+    )
+
+    page_stats = all_pages.merge(page_counts, on="page", how="left").fillna({"n_tokens": 0})
+    page_stats["n_tokens"] = page_stats["n_tokens"].astype(int)
+
+    st.subheader("페이지별 텍스트 토큰 수 (혼합형 PDF 판별용)")
+    st.dataframe(page_stats, use_container_width=True)
+
+    scanned_like = page_stats[page_stats["n_tokens"] < 20]
+    if len(scanned_like) > 0:
+        st.warning(f"토큰이 거의 없는 페이지가 {len(scanned_like)}개 있어요 → 이 페이지들은 OCR이 필요할 가능성이 큽니다.")
+    else:
+        st.info("모든 페이지에서 토큰이 충분히 나옵니다 → OCR 없이도 구조화가 가능합니다.")
+        
+    
+    
+    
+    
 
     st.write(f"추출 토큰 수: {len(df):,}")
     st.dataframe(df.head(200), use_container_width=True)
