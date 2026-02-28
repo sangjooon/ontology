@@ -3,3 +3,4 @@ pymupdf
 pillow
 pandas
 openpyxl
+pytesseract
