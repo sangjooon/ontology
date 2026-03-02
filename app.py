@@ -299,6 +299,54 @@ def guess_doc_type(text: str) -> str:
     return DOC_UNKNOWN
 
 
+
+
+def _looks_like_registry_continuation_text(text: str) -> bool:
+    """
+    등기사항전부증명서(토지/건물) 2페이지 이후처럼
+    타이틀(등기사항전부증명서)이 빠지고, 표만 이어지는 페이지를 잡아내기 위한 휴리스틱.
+    """
+    t = norm_key(text)
+    if not t:
+        return False
+
+    # '갑구/을구/표제부'가 직접 등장하면 매우 강함
+    if "갑구" in t or "을구" in t or "표제부" in t:
+        return True
+
+    # 표 헤더 조합(순위번호/등기목적/접수/등기원인/권리자)이 3개 이상이면 등기 표일 가능성이 높음
+    keys = ["순위번호", "등기목적", "접수", "등기원인", "권리자"]
+    hits = sum(1 for k in keys if k in t)
+    if hits >= 3:
+        return True
+
+    return False
+
+
+def refine_doc_types_by_context(pages: List[PageContent]) -> None:
+    """
+    guess_doc_type가 잡지 못한 '이어지는 페이지'를 이전 문서 타입으로 보정.
+    예: 등기 2~N페이지는 '등기사항전부증명서' 문구가 없어서 UNKNOWN으로 떨어지는 문제 해결.
+    """
+    prev: str = DOC_UNKNOWN
+    for p in pages:
+        if p.doc_type != DOC_UNKNOWN:
+            prev = p.doc_type
+            continue
+
+        if _looks_like_registry_continuation_text(p.raw_text):
+            # 직전이 등기라면 그대로 이어받기
+            if prev in (DOC_REGISTRY_LAND, DOC_REGISTRY_BUILDING):
+                p.doc_type = prev
+            else:
+                # 직전 타입이 없다면 텍스트에 토지/건물 단서로 추정
+                tn = norm_key(p.raw_text)
+                if "건물" in tn and "토지" not in tn:
+                    p.doc_type = DOC_REGISTRY_BUILDING
+                else:
+                    p.doc_type = DOC_REGISTRY_LAND
+            prev = p.doc_type
+
 # ============================================================
 # 6) 라벨-값 추출(좌표 기반)
 # ============================================================
@@ -941,7 +989,24 @@ def finalize_property_records(aggregates: Dict[str, PropertyAggregate]) -> Tuple
 # ============================================================
 # 10.5) (추가) 등기사항전부증명서(토지) 표제부/갑구/을구 "그대로" 테이블화 + 소재지번 일치 검증
 # ============================================================
-ROWNO_RE = re.compile(r"^\d+(?:-\d+)?$")
+# row 시작 판단용 (표시번호/순위번호):
+# - "1", "13-2" 같은 순수 번호뿐 아니라
+# - "1 (전 1)" 처럼 말소표시가 붙는 경우도 row 시작으로 인정해야 함
+ROW_START_RE = re.compile(r"^\s*(\d+(?:\s*-\s*\d+)?)")
+
+_DASH_TRANS = str.maketrans({
+    "–": "-",
+    "—": "-",
+    "−": "-",
+    "﹣": "-",
+    "－": "-",
+})
+
+def _normalize_row_cell(s: str) -> str:
+    """순위번호/표시번호 셀에서 하이픈 주변 공백/대시문자 흔들림을 정리."""
+    s = (s or "").translate(_DASH_TRANS)
+    s = re.sub(r"\s*-\s*", "-", s.strip())
+    return s
 
 
 def _line_text(line: List[Token]) -> str:
@@ -1039,13 +1104,44 @@ def _parse_table_from_lines(
     header_search_limit: int = 12,
     merge_wrap_rows: bool = True,
     first_col_is_rowno: bool = True,
+    include_page_col: bool = True,
+    page_col_name: str = "페이지",
 ) -> pd.DataFrame:
     """
     lines(섹션 내부)에서 표 헤더를 찾아 column boundary를 만든 뒤 row로 파싱한다.
-    - merge_wrap_rows=True: 첫 컬럼이 비어있으면 이전 row에 이어붙임(셀 줄바꿈 대응)
+
+    핵심 요구사항(감정평가/등기 실무):
+    - 표제부: "표시번호"로 row가 시작
+    - 갑구/을구: "순위번호"로 row가 시작 (예: '1 (전 1)', '13-2' 등도 row 시작으로 인정)
+    - 페이지가 넘어가며 반복되는 헤더/페이지머리말([토지] ... 496-10)은 데이터로 보지 않고 스킵
+    - merge_wrap_rows=True: 첫 컬럼이 비어있거나(또는 row 시작이 아니면) 이전 row에 이어붙임(셀 줄바꿈/페이지 분할 대응)
     """
     if not lines:
-        return pd.DataFrame(columns=col_names)
+        cols = ([page_col_name] if include_page_col else []) + col_names
+        return pd.DataFrame(columns=cols)
+
+    def header_hits(line: List[Token]) -> int:
+        hits = 0
+        for variants in columns:
+            if _find_line_index_contains([line], variants) is not None:
+                hits += 1
+        return hits
+
+    def looks_like_page_header(line: List[Token]) -> bool:
+        # 예: "[토지] 경기도 화성시 정남면 계향리 496-10"
+        s = _line_text(line)
+        t = norm_key(s)
+        if not t:
+            return False
+        if "발급확인번호" in t or "발급일" in t:
+            return True
+        # 주소+지번이 있고, 표 헤더 키워드는 없는 경우를 page header로 간주
+        if re.search(r"\b\d{1,4}(?:-\d{1,4})?\b", s):
+            if ("순위번호" not in t) and ("표시번호" not in t) and ("등기목적" not in t) and ("소재지번" not in t):
+                # 지역 키워드가 어느 정도 있으면 page header 가능성이 높음
+                if any(k in t for k in ["경기도","서울","부산","대구","인천","광주","대전","울산","세종","충청","전라","경상","제주","시","군","구","읍","면","동","리"]):
+                    return True
+        return False
 
     # 1) 헤더 라인 찾기: 컬럼 라벨이 가장 많이 매칭되는 라인을 헤더로 간주
     best_i = 0
@@ -1053,10 +1149,7 @@ def _parse_table_from_lines(
     limit = min(header_search_limit, len(lines))
     for i in range(limit):
         line = lines[i]
-        hits = 0
-        for variants in columns:
-            if _find_line_index_contains([line], variants) is not None:
-                hits += 1
+        hits = header_hits(line)
         if hits > best_hits:
             best_hits = hits
             best_i = i
@@ -1065,10 +1158,21 @@ def _parse_table_from_lines(
     centers = _col_centers_from_header(header_line, columns)
     bounds = _bounds_from_centers(centers)
 
+    # 반복 헤더 판정 임계값(너무 낮으면 정상 데이터도 스킵될 수 있어 보수적으로)
+    header_skip_threshold = max(2, len(columns) // 2)
+
     # 2) 데이터 라인 파싱(헤더 다음부터)
     rows: List[Dict[str, str]] = []
     for line in lines[best_i + 1 :]:
         if not line:
+            continue
+
+        # (A) 페이지 머리말 스킵
+        if looks_like_page_header(line):
+            continue
+
+        # (B) 반복 헤더 스킵 (페이지가 바뀌면 헤더가 다시 나오는 경우)
+        if header_hits(line) >= header_skip_threshold:
             continue
 
         cols: List[List[Token]] = [[] for _ in col_names]
@@ -1084,27 +1188,44 @@ def _parse_table_from_lines(
 
         row = {col_names[i]: normalize_whitespace(values[i]) for i in range(len(col_names))}
 
+        # 첫 컬럼(표시번호/순위번호)은 하이픈 공백 정리
+        row_first = _normalize_row_cell(row.get(col_names[0], "")) if col_names else ""
+        if col_names:
+            row[col_names[0]] = row_first
+
+        # 이 라인의 페이지 번호(행이 시작한 페이지로 기록)
+        if include_page_col:
+            try:
+                row_page = min(t.page for t in line)
+            except Exception:
+                row_page = None
+            row[page_col_name] = row_page
+
         # row wrap merge
         if merge_wrap_rows and rows:
-            first_val = (row.get(col_names[0]) or "").strip()
+            first_val = (row.get(col_names[0]) or "").strip() if col_names else ""
             is_new_row = True
             if first_col_is_rowno:
-                is_new_row = bool(ROWNO_RE.match(first_val)) if first_val else False
-            # 첫 컬럼이 비어있거나 rowno가 아니면 이전 row에 이어붙이기
+                # "1", "1-2", "1 (전 1)" 등: 맨 앞에 숫자/숫자-숫자 있으면 새 row
+                is_new_row = bool(ROW_START_RE.match(first_val)) if first_val else False
+
+            # 첫 컬럼이 비어있거나 row 시작이 아니면 이전 row에 이어붙이기
             if not is_new_row:
                 prev = rows[-1]
                 for k in col_names:
                     if row.get(k):
                         prev[k] = (prev.get(k, "") + " " + row[k]).strip()
+                # 페이지는 row 시작 페이지 유지(업데이트하지 않음)
                 continue
 
-        # 완전히 빈 행이면 스킵
+        # 완전히 빈 행이면 스킵 (페이지 컬럼 제외)
         if all(not row.get(k) for k in col_names):
             continue
 
         rows.append(row)
 
-    return pd.DataFrame(rows, columns=col_names)
+    cols_out = ([page_col_name] if include_page_col else []) + col_names
+    return pd.DataFrame(rows, columns=cols_out)
 
 
 def _extract_top_address_before_pyo(page: PageContent, pyo_idx: int) -> str:
@@ -1136,67 +1257,141 @@ def _extract_lot_from_any(v: str) -> str:
     return normalize_lot(m.group(1)) if m else ""
 
 
-def extract_registry_land_tables(pages: List[PageContent]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def extract_registry_land_tables(
+    pages: List[PageContent],
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    등기사항전부증명서(토지) 페이지들에서
+    등기사항전부증명서(말소사항포함) - 토지(제출용)에서
     - 표제부/갑구/을구 테이블을 최대한 '그대로' DataFrame으로 구성
-    - 표제부 위 토지 소재지번 vs 표제부 소재지번 일치 여부를 검증
+    - 표제부 위 '토지 소재지번' vs 표제부 '소재지번'의 지번(예: 496-10) 일치 여부 검증
+
+    ⚠️ 중요: 등기 2페이지 이후는 '등기사항전부증명서' 타이틀이 빠지고 표만 이어지는 경우가 많음.
+       따라서 process_pdf()에서 refine_doc_types_by_context()로 doc_type을 보정해둔다는 전제.
+       그래도 혹시 모를 누락을 줄이기 위해, 여기서도 표 특징이 있는 페이지는 포함한다.
+
     반환:
       (df_check, df_pyo, df_gab, df_eul)
     """
-    # 컬럼 정의(토지 등기 표준 형태)
-    pyo_cols = [("표시번호",), ("접수",), ("소재지번",), ("지목",), ("면적",), ("등기원인및기타사항", "등기원인", "기타사항")]
+
+    # ---- 컬럼 정의(토지 등기 표준 형태) ----
+    pyo_cols = [
+        ("표시번호",),
+        ("접수",),
+        ("소재지번",),
+        ("지목",),
+        ("면적",),
+        ("등기원인및기타사항", "등기원인", "기타사항"),
+    ]
     pyo_names = ["표시번호", "접수", "소재지번", "지목", "면적", "등기원인및기타사항"]
 
-    gab_cols = [("순위번호",), ("등기목적",), ("접수",), ("등기원인",), ("권리자및기타사항", "권리자", "기타사항")]
+    gab_cols = [
+        ("순위번호",),
+        ("등기목적",),
+        ("접수",),
+        ("등기원인",),
+        ("권리자및기타사항", "권리자", "기타사항"),
+    ]
     gab_names = ["순위번호", "등기목적", "접수", "등기원인", "권리자및기타사항"]
 
-    eul_cols = [("순위번호",), ("등기목적",), ("접수",), ("등기원인",), ("권리자및기타사항", "권리자", "기타사항")]
+    eul_cols = [
+        ("순위번호",),
+        ("등기목적",),
+        ("접수",),
+        ("등기원인",),
+        ("권리자및기타사항", "권리자", "기타사항"),
+    ]
     eul_names = ["순위번호", "등기목적", "접수", "등기원인", "권리자및기타사항"]
 
-    check_rows: List[Dict] = []
-    pyo_rows: List[pd.DataFrame] = []
-    gab_rows: List[pd.DataFrame] = []
-    eul_rows: List[pd.DataFrame] = []
+    # ---- 등기(토지) 페이지 후보 모으기 ----
+    def is_registry_like_page(p: PageContent) -> bool:
+        if p.source != "ocr":
+            return False
+        if p.doc_type == DOC_REGISTRY_LAND:
+            return True
+        # 혹시 doc_type이 UNKNOWN으로 남았더라도 표 특징이 있으면 포함
+        return _looks_like_registry_continuation_text(p.raw_text)
 
-    # page 순서대로
-    reg_pages = [p for p in pages if p.doc_type == DOC_REGISTRY_LAND and p.source == "ocr"]
+    reg_pages = [p for p in pages if is_registry_like_page(p)]
     reg_pages = sorted(reg_pages, key=lambda p: (p.property_key or "", p.page_no))
 
+    # property_key(지번)별로 그룹화
+    groups: Dict[str, List[PageContent]] = {}
     for p in reg_pages:
-        if not p.lines:
-            p.lines = group_lines_for_page(p.tokens)
+        if not p.property_key:
+            continue
+        groups.setdefault(p.property_key, []).append(p)
 
-        lines = p.lines
+    check_rows: List[Dict] = []
+    pyo_dfs: List[pd.DataFrame] = []
+    gab_dfs: List[pd.DataFrame] = []
+    eul_dfs: List[pd.DataFrame] = []
 
-        # 섹션 마커 라인 찾기
-        pyo_idx = _find_line_index_contains(lines, ("표제부", "표 제 부"))
-        gab_idx = _find_line_index_contains(lines, ("갑구", "갑 구"))
-        eul_idx = _find_line_index_contains(lines, ("을구", "을 구"))
+    # ---- 그룹별로 '연속 라인'을 만들고 섹션을 잘라 파싱 ----
+    for pk, plist in groups.items():
+        plist = sorted(plist, key=lambda p: p.page_no)
 
-        # 표제부
+        # 1) 라인 합치기(페이지 순서대로)
+        all_lines: List[List[Token]] = []
+        for p in plist:
+            if not p.lines:
+                p.lines = group_lines_for_page(p.tokens)
+            all_lines.extend(p.lines)
+
+        # 2) 섹션 마커 위치 찾기(전체 라인 기준)
+        pyo_idx = _find_line_index_contains(all_lines, ("표제부", "표 제 부"))
+        gab_idx = _find_line_index_contains(all_lines, ("갑구", "갑 구"))
+        eul_idx = _find_line_index_contains(all_lines, ("을구", "을 구"))
+
+        # 3) 을구 종료 마커(매매목록 등) 탐색
+        end_markers = ("매매목록", "매 매 목 록", "공동담보목록", "공동 담보 목록", "이하여백", "관할등기소")
+        end_idx = None
+        if eul_idx is not None:
+            sub = all_lines[eul_idx + 1 :]
+            rel = _find_line_index_contains(sub, end_markers)
+            if rel is not None:
+                end_idx = eul_idx + 1 + rel
+        if end_idx is None:
+            end_idx = len(all_lines)
+
+        # 4) 표제부 파싱
         if pyo_idx is not None:
-            end = min([x for x in [gab_idx, eul_idx, len(lines)] if x is not None])
-            section = lines[pyo_idx + 1 : end]
-            df = _parse_table_from_lines(
+            candidates_end = [x for x in [gab_idx, eul_idx, end_idx, len(all_lines)] if x is not None]
+            pyo_end = min(candidates_end) if candidates_end else len(all_lines)
+            section = all_lines[pyo_idx + 1 : pyo_end]
+
+            df_pyo = _parse_table_from_lines(
                 section,
                 columns=pyo_cols,
                 col_names=pyo_names,
-                header_search_limit=10,
+                header_search_limit=15,
                 merge_wrap_rows=True,
                 first_col_is_rowno=True,
+                include_page_col=True,
+                page_col_name="페이지",
             )
-            if not df.empty:
-                df.insert(0, "페이지", p.page_no)
-                df.insert(0, "지번", p.property_key)
-                pyo_rows.append(df)
 
-            # 소재지번 검증 (표제부가 있는 페이지에서만)
-            top_addr = _extract_top_address_before_pyo(p, pyo_idx)
+            if not df_pyo.empty:
+                df_pyo.insert(0, "지번", pk)
+                pyo_dfs.append(df_pyo)
+
+            # ---- 소재지번 검증(표제부 위 토지 소재지번 vs 표제부 소재지번) ----
+            # 표제부는 일반적으로 첫 페이지에 있으므로, 표제부 마커가 실제로 있는 페이지를 찾아 위쪽 라인을 본다
+            pyo_page = None
+            pyo_page_idx = None
+            for p in plist:
+                if not p.lines:
+                    p.lines = group_lines_for_page(p.tokens)
+                i = _find_line_index_contains(p.lines, ("표제부", "표 제 부"))
+                if i is not None:
+                    pyo_page = p
+                    pyo_page_idx = i
+                    break
+
+            top_addr = _extract_top_address_before_pyo(pyo_page, pyo_page_idx) if (pyo_page and pyo_page_idx is not None) else ""
+
             pyo_addr = ""
-            if not df.empty and "소재지번" in df.columns:
-                # 표제부 소재지번은 첫 번째 non-empty
-                vals = [v for v in df["소재지번"].tolist() if isinstance(v, str) and v.strip()]
+            if not df_pyo.empty and "소재지번" in df_pyo.columns:
+                vals = [v for v in df_pyo["소재지번"].tolist() if isinstance(v, str) and v.strip()]
                 pyo_addr = vals[0] if vals else ""
 
             top_lot = _extract_lot_from_any(top_addr)
@@ -1208,8 +1403,8 @@ def extract_registry_land_tables(pages: List[PageContent]) -> Tuple[pd.DataFrame
 
             check_rows.append(
                 {
-                    "지번": p.property_key,
-                    "페이지": p.page_no,
+                    "지번": pk,
+                    "페이지(표제부)": pyo_page.page_no if pyo_page else None,
                     "토지_소재지번(표제부위)": top_addr,
                     "표제부_소재지번": pyo_addr,
                     "지번추출(표제부위)": top_lot,
@@ -1218,47 +1413,66 @@ def extract_registry_land_tables(pages: List[PageContent]) -> Tuple[pd.DataFrame
                 }
             )
 
-        # 갑구
+        # 5) 갑구 파싱 (갑구~을구 전까지)
         if gab_idx is not None:
-            end = eul_idx if eul_idx is not None and eul_idx > gab_idx else len(lines)
-            section = lines[gab_idx + 1 : end]
-            df = _parse_table_from_lines(
+            gab_end = eul_idx if (eul_idx is not None and eul_idx > gab_idx) else end_idx
+            section = all_lines[gab_idx + 1 : gab_end]
+
+            df_gab = _parse_table_from_lines(
                 section,
                 columns=gab_cols,
                 col_names=gab_names,
-                header_search_limit=10,
+                header_search_limit=20,
                 merge_wrap_rows=True,
                 first_col_is_rowno=True,
+                include_page_col=True,
+                page_col_name="페이지",
             )
-            if not df.empty:
-                df.insert(0, "페이지", p.page_no)
-                df.insert(0, "지번", p.property_key)
-                gab_rows.append(df)
+            if not df_gab.empty:
+                df_gab.insert(0, "지번", pk)
+                gab_dfs.append(df_gab)
 
-        # 을구
+        # 6) 을구 파싱 (을구~매매목록 전까지)
         if eul_idx is not None:
-            section = lines[eul_idx + 1 :]
-            df = _parse_table_from_lines(
+            section = all_lines[eul_idx + 1 : end_idx]
+
+            df_eul = _parse_table_from_lines(
                 section,
                 columns=eul_cols,
                 col_names=eul_names,
-                header_search_limit=10,
+                header_search_limit=25,
                 merge_wrap_rows=True,
                 first_col_is_rowno=True,
+                include_page_col=True,
+                page_col_name="페이지",
             )
-            if not df.empty:
-                df.insert(0, "페이지", p.page_no)
-                df.insert(0, "지번", p.property_key)
-                eul_rows.append(df)
 
+            # '기록사항 없음' 케이스 보강
+            if df_eul.empty:
+                sec_text = "\n".join(_line_text(l) for l in section[:80])
+                if "기록사항" in sec_text and "없" in sec_text:
+                    df_eul = pd.DataFrame(
+                        [{
+                            "페이지": None,
+                            "순위번호": "",
+                            "등기목적": "기록사항 없음",
+                            "접수": "",
+                            "등기원인": "",
+                            "권리자및기타사항": "",
+                        }]
+                    )
+
+            if not df_eul.empty:
+                df_eul.insert(0, "지번", pk)
+                eul_dfs.append(df_eul)
+
+    # ---- 최종 DF 구성 ----
     df_check = pd.DataFrame(check_rows) if check_rows else pd.DataFrame(
-        columns=["지번", "페이지", "토지_소재지번(표제부위)", "표제부_소재지번", "지번추출(표제부위)", "지번추출(표제부)", "일치여부"]
+        columns=["지번", "페이지(표제부)", "토지_소재지번(표제부위)", "표제부_소재지번", "지번추출(표제부위)", "지번추출(표제부)", "일치여부"]
     )
-    df_pyo = pd.concat(pyo_rows, ignore_index=True) if pyo_rows else pd.DataFrame(columns=["지번", "페이지"] + pyo_names)
-    df_gab = pd.concat(gab_rows, ignore_index=True) if gab_rows else pd.DataFrame(columns=["지번", "페이지"] + gab_names)
-    df_eul = pd.concat(eul_rows, ignore_index=True) if eul_rows else pd.DataFrame(columns=["지번", "페이지"] + eul_names)
-
-    # (옵션) 동일 지번에서 페이지가 바뀌며 첫 컬럼이 빈 줄이 이어지는 케이스가 있으면 여기서 추가 merge 가능
+    df_pyo = pd.concat(pyo_dfs, ignore_index=True) if pyo_dfs else pd.DataFrame(columns=["지번", "페이지"] + pyo_names)
+    df_gab = pd.concat(gab_dfs, ignore_index=True) if gab_dfs else pd.DataFrame(columns=["지번", "페이지"] + gab_names)
+    df_eul = pd.concat(eul_dfs, ignore_index=True) if eul_dfs else pd.DataFrame(columns=["지번", "페이지"] + eul_names)
 
     return df_check, df_pyo, df_gab, df_eul
 
@@ -1372,6 +1586,9 @@ def process_pdf(file_bytes: bytes, api_url: str, secret_key: str, progress_cb: O
             p.raw_text = tokens_to_text(p.tokens)
 
         p.doc_type = guess_doc_type(p.raw_text)
+
+    # (3.5) 문서 타입 보정(등기 이어지는 페이지 등)
+    refine_doc_types_by_context(pages)
 
     # (4) 페이지별 지번(property_key) 추정 + 스캔하면서 carry-forward
     current_pk = ""
@@ -1594,4 +1811,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
