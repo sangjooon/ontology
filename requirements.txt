@@ -1,7 +1,6 @@
 streamlit
-pymupdf
-pillow
+requests
 pandas
 openpyxl
-pytesseract
+pypdf
 PyPDF2
