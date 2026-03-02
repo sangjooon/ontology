@@ -40,6 +40,7 @@ APP_VERSION = "v0.1.0"
 DEFAULT_PASSWORD = "alohomora"  # ⚠️ 데모용. 실제 서비스에선 제거/변경 권장
 
 OCR_MAX_PAGES_PER_REQUEST = 10       # 네이버 OCR PDF 요청당 페이지 수(보수적으로 10)
+FORCE_OCR_ALL_PAGES = True         # ✅ 모든 페이지를 OCR로 처리(비용↑, 추출 일관성↑)
 PDF_TEXT_MIN_CHARS = 40              # 이 이상 텍스트가 있으면 "텍스트 PDF"로 간주하여 OCR 스킵
 PDF_TEXT_MIN_HANGUL = 3              # 한글이 이 이상 포함되면 텍스트 페이지 확률↑
 LINE_GROUP_MIN_Y_THRESH = 8.0        # 라인 그룹핑 최소 y threshold
@@ -513,6 +514,46 @@ def normalize_address(v: str) -> str:
     return normalize_whitespace(v)
 
 
+# ---- 지목(토지의 지목) 정규화 ----
+# 지목은 법정 28종(관행적으로 쓰는 목록)으로 수렴하므로 OCR 흔들림(예: 임야->음야)을 보정하기 좋습니다.
+LAND_CATEGORY_ALLOWED = [
+    "전", "답", "과수원", "목장용지", "임야", "광천지", "염전",
+    "대", "공장용지", "학교용지", "주차장", "주유소용지", "창고용지",
+    "도로", "철도용지", "제방", "하천", "구거", "유지", "양어장",
+    "수도용지", "공원", "체육용지", "유원지", "종교용지", "사적지",
+    "묘지", "잡종지",
+]
+
+# 자주 나오는 OCR 오독 케이스를 먼저 교정(필요시 계속 추가)
+LAND_CATEGORY_FIX = {
+    "음야": "임야",
+    "임아": "임야",
+}
+
+def normalize_land_category(v: str) -> str:
+    v0 = normalize_whitespace(v)
+    # 토큰 중 한글만 남김(면적/기호 섞이는 경우 방지)
+    v1 = re.sub(r"[^가-힣]", "", v0)
+
+    if not v1:
+        return v0
+
+    if v1 in LAND_CATEGORY_FIX:
+        return LAND_CATEGORY_FIX[v1]
+
+    if v1 in LAND_CATEGORY_ALLOWED:
+        return v1
+
+    # 1글자 지목은 퍼지매칭 위험이 커서(전/답/대) 그대로 반환
+    if len(v1) == 1:
+        return v1
+
+    # 퍼지 매칭으로 가장 비슷한 지목으로 보정(너무 과도한 보정 방지 위해 cutoff 사용)
+    import difflib
+    m = difflib.get_close_matches(v1, LAND_CATEGORY_ALLOWED, n=1, cutoff=0.6)
+    return m[0] if m else v1
+
+
 OWNER_RE = re.compile(r"소유자\s*([가-힣]{2,5})\s*\d{6}-\*{4,7}")
 
 
@@ -572,7 +613,7 @@ FS_SITE = FieldSpec(
 )
 FS_ROAD_ADDR = FieldSpec("도로명주소", ("도로명주소",), allow_multiline=True, normalizer=normalize_address, priority=5)
 
-FS_LAND_CATEGORY = FieldSpec("지목", ("지목",), normalizer=normalize_whitespace, priority=10)
+FS_LAND_CATEGORY = FieldSpec("지목", ("지목",), normalizer=normalize_land_category, priority=10)
 FS_LAND_AREA = FieldSpec("토지면적", ("면적", "대지면적"), normalizer=normalize_area, validator=valid_area, priority=10)
 
 FS_FLOOR_AREA = FieldSpec("연면적", ("연면적",), normalizer=normalize_area, validator=valid_area, priority=20)
@@ -896,15 +937,360 @@ def finalize_property_records(aggregates: Dict[str, PropertyAggregate]) -> Tuple
     return df_final, df_cands
 
 
+
+# ============================================================
+# 10.5) (추가) 등기사항전부증명서(토지) 표제부/갑구/을구 "그대로" 테이블화 + 소재지번 일치 검증
+# ============================================================
+ROWNO_RE = re.compile(r"^\d+(?:-\d+)?$")
+
+
+def _line_text(line: List[Token]) -> str:
+    return " ".join(t.text for t in line).strip()
+
+
+def _find_line_index_contains(lines: List[List[Token]], variants: Tuple[str, ...]) -> Optional[int]:
+    """lines에서 variants(예: ('표제부','표 제 부'))를 포함하는 첫 번째 라인 index."""
+    target_norms = {norm_key(v) for v in variants if norm_key(v)}
+    for i, line in enumerate(lines):
+        tnorm = norm_key(_line_text(line))
+        if not tnorm:
+            continue
+        for tn in target_norms:
+            if tn and tn in tnorm:
+                return i
+    return None
+
+
+def _col_centers_from_header(header_line: List[Token], columns: List[Tuple[str, ...]]) -> List[float]:
+    """
+    헤더 라인에서 각 컬럼 라벨의 x-center를 찾는다.
+    라벨을 못 찾으면 (가능한 범위 내) 보간/균등분할로 채운다.
+    """
+    centers: List[Optional[float]] = []
+    for variants in columns:
+        span = find_label_span(header_line, variants)
+        if span is None:
+            centers.append(None)
+            continue
+        s, e = span
+        xs = [t.cx for t in header_line[s : e + 1]]
+        centers.append(sum(xs) / len(xs) if xs else None)
+
+    # fallback: 라벨을 하나도 못 찾으면 균등 분할
+    if all(c is None for c in centers):
+        xs = [t.cx for t in header_line]
+        if not xs:
+            return [0.0 for _ in columns]
+        xmin, xmax = min(xs), max(xs)
+        n = len(columns)
+        return [xmin + (xmax - xmin) * (i / max(1, n - 1)) for i in range(n)]
+
+    # 보간: None을 좌/우에서 가장 가까운 값으로 채우거나 선형 보간
+    out = centers[:]
+    # 왼쪽->오른쪽
+    last = None
+    for i in range(len(out)):
+        if out[i] is not None:
+            last = out[i]
+        elif last is not None:
+            out[i] = last + 1.0  # 최소 증가
+    # 오른쪽->왼쪽
+    last = None
+    for i in range(len(out) - 1, -1, -1):
+        if out[i] is not None:
+            last = out[i]
+        elif last is not None:
+            out[i] = last - 1.0
+    # 아직 None이 있으면(가운데 전부 None 같은 경우) 균등으로 채움
+    if any(c is None for c in out):
+        xs = [c for c in out if c is not None]
+        xmin = min(xs) if xs else 0.0
+        xmax = max(xs) if xs else (xmin + 1000.0)
+        n = len(out)
+        out = [xmin + (xmax - xmin) * (i / max(1, n - 1)) for i in range(n)]
+
+    return [float(c) for c in out]  # type: ignore
+
+
+def _bounds_from_centers(centers: List[float]) -> List[float]:
+    """centers로부터 경계(boundary) 생성. col index는 (cx <= b0)->0, (b0<cx<=b1)->1 ..."""
+    if not centers:
+        return []
+    centers = sorted(centers)
+    bounds = []
+    for i in range(len(centers) - 1):
+        bounds.append((centers[i] + centers[i + 1]) / 2.0)
+    return bounds
+
+
+def _assign_col(cx: float, bounds: List[float]) -> int:
+    """cx를 경계에 따라 컬럼 인덱스로 변환."""
+    for i, b in enumerate(bounds):
+        if cx <= b:
+            return i
+    return len(bounds)
+
+
+def _parse_table_from_lines(
+    lines: List[List[Token]],
+    *,
+    columns: List[Tuple[str, ...]],
+    col_names: List[str],
+    header_search_limit: int = 12,
+    merge_wrap_rows: bool = True,
+    first_col_is_rowno: bool = True,
+) -> pd.DataFrame:
+    """
+    lines(섹션 내부)에서 표 헤더를 찾아 column boundary를 만든 뒤 row로 파싱한다.
+    - merge_wrap_rows=True: 첫 컬럼이 비어있으면 이전 row에 이어붙임(셀 줄바꿈 대응)
+    """
+    if not lines:
+        return pd.DataFrame(columns=col_names)
+
+    # 1) 헤더 라인 찾기: 컬럼 라벨이 가장 많이 매칭되는 라인을 헤더로 간주
+    best_i = 0
+    best_hits = -1
+    limit = min(header_search_limit, len(lines))
+    for i in range(limit):
+        line = lines[i]
+        hits = 0
+        for variants in columns:
+            if _find_line_index_contains([line], variants) is not None:
+                hits += 1
+        if hits > best_hits:
+            best_hits = hits
+            best_i = i
+
+    header_line = lines[best_i]
+    centers = _col_centers_from_header(header_line, columns)
+    bounds = _bounds_from_centers(centers)
+
+    # 2) 데이터 라인 파싱(헤더 다음부터)
+    rows: List[Dict[str, str]] = []
+    for line in lines[best_i + 1 :]:
+        if not line:
+            continue
+
+        cols: List[List[Token]] = [[] for _ in col_names]
+        for tok in line:
+            ci = _assign_col(tok.cx, bounds)
+            if 0 <= ci < len(cols):
+                cols[ci].append(tok)
+
+        values = []
+        for toks in cols:
+            toks_sorted = sorted(toks, key=lambda t: t.cx)
+            values.append(" ".join(t.text for t in toks_sorted).strip())
+
+        row = {col_names[i]: normalize_whitespace(values[i]) for i in range(len(col_names))}
+
+        # row wrap merge
+        if merge_wrap_rows and rows:
+            first_val = (row.get(col_names[0]) or "").strip()
+            is_new_row = True
+            if first_col_is_rowno:
+                is_new_row = bool(ROWNO_RE.match(first_val)) if first_val else False
+            # 첫 컬럼이 비어있거나 rowno가 아니면 이전 row에 이어붙이기
+            if not is_new_row:
+                prev = rows[-1]
+                for k in col_names:
+                    if row.get(k):
+                        prev[k] = (prev.get(k, "") + " " + row[k]).strip()
+                continue
+
+        # 완전히 빈 행이면 스킵
+        if all(not row.get(k) for k in col_names):
+            continue
+
+        rows.append(row)
+
+    return pd.DataFrame(rows, columns=col_names)
+
+
+def _extract_top_address_before_pyo(page: PageContent, pyo_idx: int) -> str:
+    """
+    표제부 라인 위쪽에서 '토지 소재지번' 후보를 찾는다.
+    - 가장 긴 라인 중 '지번 패턴'을 포함하고, 한글이 어느 정도 포함된 라인을 선택
+    """
+    if not page.lines:
+        return ""
+
+    candidates = []
+    for i in range(0, max(0, pyo_idx)):
+        s = _line_text(page.lines[i])
+        if not s:
+            continue
+        if not re.search(r"\b\d{1,4}(?:-\d{1,4})?\b", s):
+            continue
+        if count_hangul(s) < 6:
+            continue
+        candidates.append(s)
+
+    if not candidates:
+        return ""
+    return max(candidates, key=lambda x: len(x)).strip()
+
+
+def _extract_lot_from_any(v: str) -> str:
+    m = re.search(r"\b(\d{1,4}(?:-\d{1,4})?)\b", v or "")
+    return normalize_lot(m.group(1)) if m else ""
+
+
+def extract_registry_land_tables(pages: List[PageContent]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    등기사항전부증명서(토지) 페이지들에서
+    - 표제부/갑구/을구 테이블을 최대한 '그대로' DataFrame으로 구성
+    - 표제부 위 토지 소재지번 vs 표제부 소재지번 일치 여부를 검증
+    반환:
+      (df_check, df_pyo, df_gab, df_eul)
+    """
+    # 컬럼 정의(토지 등기 표준 형태)
+    pyo_cols = [("표시번호",), ("접수",), ("소재지번",), ("지목",), ("면적",), ("등기원인및기타사항", "등기원인", "기타사항")]
+    pyo_names = ["표시번호", "접수", "소재지번", "지목", "면적", "등기원인및기타사항"]
+
+    gab_cols = [("순위번호",), ("등기목적",), ("접수",), ("등기원인",), ("권리자및기타사항", "권리자", "기타사항")]
+    gab_names = ["순위번호", "등기목적", "접수", "등기원인", "권리자및기타사항"]
+
+    eul_cols = [("순위번호",), ("등기목적",), ("접수",), ("등기원인",), ("권리자및기타사항", "권리자", "기타사항")]
+    eul_names = ["순위번호", "등기목적", "접수", "등기원인", "권리자및기타사항"]
+
+    check_rows: List[Dict] = []
+    pyo_rows: List[pd.DataFrame] = []
+    gab_rows: List[pd.DataFrame] = []
+    eul_rows: List[pd.DataFrame] = []
+
+    # page 순서대로
+    reg_pages = [p for p in pages if p.doc_type == DOC_REGISTRY_LAND and p.source == "ocr"]
+    reg_pages = sorted(reg_pages, key=lambda p: (p.property_key or "", p.page_no))
+
+    for p in reg_pages:
+        if not p.lines:
+            p.lines = group_lines_for_page(p.tokens)
+
+        lines = p.lines
+
+        # 섹션 마커 라인 찾기
+        pyo_idx = _find_line_index_contains(lines, ("표제부", "표 제 부"))
+        gab_idx = _find_line_index_contains(lines, ("갑구", "갑 구"))
+        eul_idx = _find_line_index_contains(lines, ("을구", "을 구"))
+
+        # 표제부
+        if pyo_idx is not None:
+            end = min([x for x in [gab_idx, eul_idx, len(lines)] if x is not None])
+            section = lines[pyo_idx + 1 : end]
+            df = _parse_table_from_lines(
+                section,
+                columns=pyo_cols,
+                col_names=pyo_names,
+                header_search_limit=10,
+                merge_wrap_rows=True,
+                first_col_is_rowno=True,
+            )
+            if not df.empty:
+                df.insert(0, "페이지", p.page_no)
+                df.insert(0, "지번", p.property_key)
+                pyo_rows.append(df)
+
+            # 소재지번 검증 (표제부가 있는 페이지에서만)
+            top_addr = _extract_top_address_before_pyo(p, pyo_idx)
+            pyo_addr = ""
+            if not df.empty and "소재지번" in df.columns:
+                # 표제부 소재지번은 첫 번째 non-empty
+                vals = [v for v in df["소재지번"].tolist() if isinstance(v, str) and v.strip()]
+                pyo_addr = vals[0] if vals else ""
+
+            top_lot = _extract_lot_from_any(top_addr)
+            pyo_lot = _extract_lot_from_any(pyo_addr)
+
+            match = "?"
+            if top_lot and pyo_lot:
+                match = "O" if top_lot == pyo_lot else "X"
+
+            check_rows.append(
+                {
+                    "지번": p.property_key,
+                    "페이지": p.page_no,
+                    "토지_소재지번(표제부위)": top_addr,
+                    "표제부_소재지번": pyo_addr,
+                    "지번추출(표제부위)": top_lot,
+                    "지번추출(표제부)": pyo_lot,
+                    "일치여부": match,
+                }
+            )
+
+        # 갑구
+        if gab_idx is not None:
+            end = eul_idx if eul_idx is not None and eul_idx > gab_idx else len(lines)
+            section = lines[gab_idx + 1 : end]
+            df = _parse_table_from_lines(
+                section,
+                columns=gab_cols,
+                col_names=gab_names,
+                header_search_limit=10,
+                merge_wrap_rows=True,
+                first_col_is_rowno=True,
+            )
+            if not df.empty:
+                df.insert(0, "페이지", p.page_no)
+                df.insert(0, "지번", p.property_key)
+                gab_rows.append(df)
+
+        # 을구
+        if eul_idx is not None:
+            section = lines[eul_idx + 1 :]
+            df = _parse_table_from_lines(
+                section,
+                columns=eul_cols,
+                col_names=eul_names,
+                header_search_limit=10,
+                merge_wrap_rows=True,
+                first_col_is_rowno=True,
+            )
+            if not df.empty:
+                df.insert(0, "페이지", p.page_no)
+                df.insert(0, "지번", p.property_key)
+                eul_rows.append(df)
+
+    df_check = pd.DataFrame(check_rows) if check_rows else pd.DataFrame(
+        columns=["지번", "페이지", "토지_소재지번(표제부위)", "표제부_소재지번", "지번추출(표제부위)", "지번추출(표제부)", "일치여부"]
+    )
+    df_pyo = pd.concat(pyo_rows, ignore_index=True) if pyo_rows else pd.DataFrame(columns=["지번", "페이지"] + pyo_names)
+    df_gab = pd.concat(gab_rows, ignore_index=True) if gab_rows else pd.DataFrame(columns=["지번", "페이지"] + gab_names)
+    df_eul = pd.concat(eul_rows, ignore_index=True) if eul_rows else pd.DataFrame(columns=["지번", "페이지"] + eul_names)
+
+    # (옵션) 동일 지번에서 페이지가 바뀌며 첫 컬럼이 빈 줄이 이어지는 케이스가 있으면 여기서 추가 merge 가능
+
+    return df_check, df_pyo, df_gab, df_eul
+
+
 # ============================================================
 # 11) Excel bytes 생성(다중시트)
 # ============================================================
-def make_excel_bytes(df_final: pd.DataFrame, df_candidates: pd.DataFrame, df_pages: pd.DataFrame) -> bytes:
+def make_excel_bytes(
+    df_final: pd.DataFrame,
+    df_candidates: pd.DataFrame,
+    df_pages: pd.DataFrame,
+    df_reg_check: pd.DataFrame,
+    df_reg_pyo: pd.DataFrame,
+    df_reg_gab: pd.DataFrame,
+    df_reg_eul: pd.DataFrame,
+) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df_final.to_excel(writer, index=False, sheet_name="extracted")
         df_candidates.to_excel(writer, index=False, sheet_name="candidates")
         df_pages.to_excel(writer, index=False, sheet_name="pages")
+
+        # 등기(토지) 표제부/갑구/을구 + 소재지번 검증
+        if df_reg_check is not None:
+            df_reg_check.to_excel(writer, index=False, sheet_name="등기_소재지번검증")
+        if df_reg_pyo is not None:
+            df_reg_pyo.to_excel(writer, index=False, sheet_name="등기_표제부")
+        if df_reg_gab is not None:
+            df_reg_gab.to_excel(writer, index=False, sheet_name="등기_갑구")
+        if df_reg_eul is not None:
+            df_reg_eul.to_excel(writer, index=False, sheet_name="등기_을구")
+
     return output.getvalue()
 
 
@@ -913,8 +1299,8 @@ def make_excel_bytes(df_final: pd.DataFrame, df_candidates: pd.DataFrame, df_pag
 # ============================================================
 def process_pdf(file_bytes: bytes, api_url: str, secret_key: str, progress_cb: Optional[Callable] = None):
     """
-    1) PDF 텍스트 추출로 OCR 스킵 가능한 페이지를 판단
-    2) OCR 필요한 페이지만 모아(최대 10페이지씩) 네이버 OCR 호출
+    1) (옵션) 텍스트 페이지 OCR 스킵 또는 모든 페이지 OCR 강제
+    2) OCR 대상 페이지들을 모아(최대 10페이지씩) 네이버 OCR 호출
     3) 페이지별 문서 타입 분류
     4) 페이지별 지번(property_key) 추정
     5) 라벨-값 기반 후보 수집 -> 지번별 최종값 선택
@@ -923,19 +1309,26 @@ def process_pdf(file_bytes: bytes, api_url: str, secret_key: str, progress_cb: O
     reader = pdf_reader_from_bytes(file_bytes)
     total_pages = len(reader.pages)
 
-    # (1) PDF 텍스트 추출
-    pdf_texts = pdf_extract_text_per_page(reader)
-
+    # (1) 페이지 준비
+    # - FORCE_OCR_ALL_PAGES=True: 모든 페이지를 OCR로 처리(비용↑, 추출 일관성↑)
+    # - False: 텍스트 PDF 페이지는 OCR 스킵(비용↓), 스캔 페이지는 OCR
     pages: List[PageContent] = []
     ocr_needed_indices: List[int] = []
 
-    for i in range(total_pages):
-        t = pdf_texts[i] or ""
-        if is_meaningful_pdf_text(t):
-            pages.append(PageContent(page_no=i + 1, source="pdf_text", raw_text=t))
-        else:
-            pages.append(PageContent(page_no=i + 1, source="ocr", raw_text=""))
-            ocr_needed_indices.append(i)
+    if FORCE_OCR_ALL_PAGES:
+        pages = [PageContent(page_no=i + 1, source="ocr", raw_text="") for i in range(total_pages)]
+        ocr_needed_indices = list(range(total_pages))
+    else:
+        # PDF 텍스트 추출(텍스트가 충분한 페이지는 OCR 스킵)
+        pdf_texts = pdf_extract_text_per_page(reader)
+
+        for i in range(total_pages):
+            t = pdf_texts[i] or ""
+            if is_meaningful_pdf_text(t):
+                pages.append(PageContent(page_no=i + 1, source="pdf_text", raw_text=t))
+            else:
+                pages.append(PageContent(page_no=i + 1, source="ocr", raw_text=""))
+                ocr_needed_indices.append(i)
 
     # (2) OCR 필요한 페이지들만 묶어서 요청
     ocr_chunks = chunk_list(ocr_needed_indices, OCR_MAX_PAGES_PER_REQUEST)
@@ -1031,6 +1424,9 @@ def process_pdf(file_bytes: bytes, api_url: str, secret_key: str, progress_cb: O
     # (6) 최종 레코드/후보 DF
     df_final, df_candidates = finalize_property_records(aggregates)
 
+    # (6.5) 등기사항전부증명서(토지) 표제부/갑구/을구 테이블 + 소재지번 일치 검증
+    df_reg_check, df_reg_pyo, df_reg_gab, df_reg_eul = extract_registry_land_tables(pages)
+
     # (7) 원본 텍스트(디버그) 합치기
     raw_text = "\n\n".join(
         f"===== PAGE {p.page_no} | {p.doc_type} | {p.source} | pk={p.property_key or '-'} =====\n{p.raw_text}".strip()
@@ -1038,8 +1434,8 @@ def process_pdf(file_bytes: bytes, api_url: str, secret_key: str, progress_cb: O
         if p.raw_text
     )
 
-    excel_bytes = make_excel_bytes(df_final, df_candidates, df_pages)
-    return raw_text, df_final, df_candidates, df_pages, excel_bytes
+    excel_bytes = make_excel_bytes(df_final, df_candidates, df_pages, df_reg_check, df_reg_pyo, df_reg_gab, df_reg_eul)
+    return raw_text, df_final, df_candidates, df_pages, df_reg_check, df_reg_pyo, df_reg_gab, df_reg_eul, excel_bytes
 
 
 # ============================================================
@@ -1050,13 +1446,22 @@ def main():
     st.title(APP_TITLE)
     st.caption(f"{APP_VERSION} | 네이버 일반 OCR + 좌표 기반 핵심필드 추출")
 
-    st.markdown(
-        """
+    if FORCE_OCR_ALL_PAGES:
+        st.markdown(
+            """
+- ✅ **모든 페이지를 OCR로 처리**합니다. (비용↑, 추출 방식 일관성↑)
+- **네이버 일반 OCR** + **bbox 좌표 기반 라벨-값 추출**로 표 인식 없이도 핵심필드를 뽑습니다.
+- 한 PDF에 여러 지번이 섞여도 **지번별로 행(row)로 정리**합니다.
+"""
+        )
+    else:
+        st.markdown(
+            """
 - **PDF 텍스트가 있는 페이지는 OCR을 스킵**해서 비용을 줄입니다.
 - 스캔 페이지(이미지)는 **네이버 일반 OCR**을 사용하되, **bbox 좌표를 활용한 라벨-값 추출**로 표 인식 없이도 핵심필드를 뽑습니다.
 - 한 PDF에 여러 지번이 섞여도 **지번별로 행(row)로 정리**합니다.
 """
-    )
+        )
 
     # 임시 비밀번호
     with st.expander("🔐 접근(데모용)", expanded=True):
@@ -1090,7 +1495,7 @@ def main():
 
     # 파일이 바뀌면 결과만 초기화(키 입력값은 유지)
     if st.session_state.get("file_hash") != file_hash:
-        for k in ["raw_text", "df_final", "df_candidates", "df_pages", "excel_bytes"]:
+        for k in ["raw_text", "df_final", "df_candidates", "df_pages", "df_reg_check", "df_reg_pyo", "df_reg_gab", "df_reg_eul", "excel_bytes"]:
             st.session_state.pop(k, None)
         st.session_state["file_hash"] = file_hash
 
@@ -1111,7 +1516,7 @@ def main():
 
         with st.spinner("OCR 및 데이터 추출 중..."):
             try:
-                raw_text, df_final, df_candidates, df_pages, excel_bytes = process_pdf(
+                raw_text, df_final, df_candidates, df_pages, df_reg_check, df_reg_pyo, df_reg_gab, df_reg_eul, excel_bytes = process_pdf(
                     file_bytes, api_url, secret_key, progress_cb=progress_cb
                 )
             except Exception as e:
@@ -1125,6 +1530,10 @@ def main():
         st.session_state["df_final"] = df_final
         st.session_state["df_candidates"] = df_candidates
         st.session_state["df_pages"] = df_pages
+        st.session_state["df_reg_check"] = df_reg_check
+        st.session_state["df_reg_pyo"] = df_reg_pyo
+        st.session_state["df_reg_gab"] = df_reg_gab
+        st.session_state["df_reg_eul"] = df_reg_eul
         st.session_state["excel_bytes"] = excel_bytes
 
     # 결과 표시
@@ -1132,6 +1541,10 @@ def main():
         df_final: pd.DataFrame = st.session_state["df_final"]
         df_candidates: pd.DataFrame = st.session_state["df_candidates"]
         df_pages: pd.DataFrame = st.session_state["df_pages"]
+        df_reg_check: pd.DataFrame = st.session_state.get("df_reg_check", pd.DataFrame())
+        df_reg_pyo: pd.DataFrame = st.session_state.get("df_reg_pyo", pd.DataFrame())
+        df_reg_gab: pd.DataFrame = st.session_state.get("df_reg_gab", pd.DataFrame())
+        df_reg_eul: pd.DataFrame = st.session_state.get("df_reg_eul", pd.DataFrame())
         raw_text: str = st.session_state["raw_text"]
         excel_bytes: bytes = st.session_state["excel_bytes"]
 
@@ -1154,6 +1567,20 @@ def main():
             st.subheader("🧭 페이지 인덱스(문서타입/지번 추정)")
             st.dataframe(df_pages, use_container_width=True, hide_index=True)
 
+            st.subheader("📌 등기(토지) 소재지번 일치 검증")
+            if df_reg_check is None or df_reg_check.empty:
+                st.info("등기사항전부증명서(토지) 페이지에서 표제부를 찾지 못했거나 아직 데이터가 없습니다.")
+            else:
+                st.dataframe(df_reg_check, use_container_width=True, hide_index=True)
+
+            with st.expander("📄 등기(토지) 표제부 / 갑구 / 을구 (테이블)", expanded=False):
+                st.markdown("**표제부**")
+                st.dataframe(df_reg_pyo if df_reg_pyo is not None else pd.DataFrame(), use_container_width=True, hide_index=True)
+                st.markdown("**갑구**")
+                st.dataframe(df_reg_gab if df_reg_gab is not None else pd.DataFrame(), use_container_width=True, hide_index=True)
+                st.markdown("**을구**")
+                st.dataframe(df_reg_eul if df_reg_eul is not None else pd.DataFrame(), use_container_width=True, hide_index=True)
+
         with col2:
             st.subheader("🧪 후보 상세(디버그)")
             st.dataframe(df_candidates, use_container_width=True, hide_index=True)
@@ -1167,3 +1594,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
