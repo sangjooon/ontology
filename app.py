@@ -27,16 +27,18 @@ import re
 import io
 import hashlib
 
+# (온톨로지/그래프 저장) JSON-LD 빌더
+from ontology_json import build_dovi_jsonld, make_jsonld_bytes
+
 from dataclasses import dataclass, field
 from typing import Callable, Optional, List, Dict, Tuple
-from ontology_jsonld import build_dovi_jsonld, make_jsonld_bytes
 
 
 # ============================================================
 # 0) 설정값
 # ============================================================
 APP_TITLE = "문서 비서📄 dev"
-APP_VERSION = "v0.1.2"
+APP_VERSION = "v0.2.0"
 
 DEFAULT_PASSWORD = "alohomora"  # ⚠️ 데모용. 실제 서비스에선 제거/변경 권장
 
@@ -1863,7 +1865,7 @@ def main():
 
     # 파일이 바뀌면 결과만 초기화(키 입력값은 유지)
     if st.session_state.get("file_hash") != file_hash:
-        for k in ["raw_text", "df_final", "df_candidates", "df_pages", "df_reg_check", "df_reg_pyo", "df_reg_gab", "df_reg_eul", "excel_bytes"]:
+        for k in ["raw_text", "df_final", "df_candidates", "df_pages", "df_reg_check", "df_reg_pyo", "df_reg_gab", "df_reg_eul", "excel_bytes", "jsonld_obj", "jsonld_bytes"]:
             st.session_state.pop(k, None)
         st.session_state["file_hash"] = file_hash
 
@@ -1904,6 +1906,47 @@ def main():
         st.session_state["df_reg_eul"] = df_reg_eul
         st.session_state["excel_bytes"] = excel_bytes
 
+        # ------------------------------
+        # 🧠 JSON-LD(온톨로지 그래프) 생성
+        # ------------------------------
+        try:
+            registry_tables = {
+                "pyo": df_reg_pyo,
+                "gab": df_reg_gab,
+                "eul": df_reg_eul,
+            }
+
+            df_checks = None
+            if df_reg_check is not None and not df_reg_check.empty:
+                df_checks = df_reg_check.copy()
+                df_checks["검증항목"] = "표제부위_지번_vs_표제부_소재지번"
+                if "토지_소재지번(표제부위)" in df_checks.columns:
+                    df_checks["좌값"] = df_checks["토지_소재지번(표제부위)"]
+                if "표제부_소재지번" in df_checks.columns:
+                    df_checks["우값"] = df_checks["표제부_소재지번"]
+
+            jsonld_obj = build_dovi_jsonld(
+                file_name=uploaded_file.name,
+                file_hash=file_hash,
+                df_final=df_final,
+                df_candidates=df_candidates,
+                df_pages=df_pages,
+                registry_tables=registry_tables,
+                df_checks=df_checks,
+                base_iri="urn:dovi:",
+                ontology_version="0.1",
+                generator_name="DOVI-Streamlit",
+                include_candidates=True,
+            )
+            jsonld_bytes = make_jsonld_bytes(jsonld_obj)
+        except Exception as e:
+            jsonld_obj = {"error": str(e)}
+            jsonld_bytes = b""
+
+        st.session_state["jsonld_obj"] = jsonld_obj
+        st.session_state["jsonld_bytes"] = jsonld_bytes
+
+
     # 결과 표시
     if "df_final" in st.session_state:
         df_final: pd.DataFrame = st.session_state["df_final"]
@@ -1925,12 +1968,26 @@ def main():
             st.dataframe(df_final, use_container_width=True, hide_index=True)
 
             st.download_button(
-                label="📥 엑셀 파일 다운로드 (extracted/candidates/pages)",
+                label="📥 엑셀 다운로드 (extracted/candidates/pages/등기표)",
                 data=excel_bytes,
                 file_name=f"규칙추출_{uploaded_file.name if uploaded_file else 'result'}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="download_excel_btn",
             )
+
+            # 🧠 JSON-LD(온톨로지 그래프) 다운로드
+            jsonld_bytes = st.session_state.get("jsonld_bytes", b"")
+            if jsonld_bytes:
+                st.download_button(
+                    label="🧠 JSON-LD(온톨로지 그래프) 다운로드",
+                    data=jsonld_bytes,
+                    file_name=f"{uploaded_file.name if uploaded_file else 'document'}_graph.jsonld",
+                    mime="application/ld+json",
+                    key="download_jsonld_btn",
+                )
+            else:
+                st.caption("JSON-LD 생성 실패 또는 데이터 없음")
+
 
             st.subheader("🧭 페이지 인덱스(문서타입/지번 추정)")
             st.dataframe(df_pages, use_container_width=True, hide_index=True)
@@ -1955,6 +2012,9 @@ def main():
 
             st.subheader("📄 페이지별 텍스트(디버그)")
             st.text_area("RAW TEXT", raw_text, height=520)
+
+            with st.expander("🧠 JSON-LD 미리보기", expanded=False):
+                st.json(st.session_state.get("jsonld_obj", {}))
 
     else:
         st.info("버튼을 눌러 추출을 시작하면 결과가 여기에 유지됩니다.")
