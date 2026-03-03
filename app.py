@@ -29,6 +29,7 @@ import hashlib
 
 from dataclasses import dataclass, field
 from typing import Callable, Optional, List, Dict, Tuple
+from ontology_jsonld import build_dovi_jsonld, make_jsonld_bytes
 
 
 # ============================================================
