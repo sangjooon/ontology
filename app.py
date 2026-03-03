@@ -35,7 +35,7 @@ from typing import Callable, Optional, List, Dict, Tuple
 # 0) 설정값
 # ============================================================
 APP_TITLE = "문서 비서📄 dev"
-APP_VERSION = "v0.1.0"
+APP_VERSION = "v0.1.2"
 
 DEFAULT_PASSWORD = "alohomora"  # ⚠️ 데모용. 실제 서비스에선 제거/변경 권장
 
@@ -991,8 +991,12 @@ def finalize_property_records(aggregates: Dict[str, PropertyAggregate]) -> Tuple
 # ============================================================
 # row 시작 판단용 (표시번호/순위번호):
 # - "1", "13-2" 같은 순수 번호뿐 아니라
-# - "1 (전 1)" 처럼 말소표시가 붙는 경우도 row 시작으로 인정해야 함
-ROW_START_RE = re.compile(r"^\s*(\d+(?:\s*-\s*\d+)?)")
+# - "1 (전 1)" 처럼 말소표시가 붙는 경우도 row 시작/번호로 인정
+ROW_START_RE = re.compile(r"^\s*(\d+(?:\s*-\s*\d+)?)(?:\s*\(\s*전\s*\d+(?:\s*-\s*\d+)?\s*\))?")
+
+_ROWNO_EXTRACT_RE = re.compile(
+    r"^\s*(\d+(?:\s*-\s*\d+)?)(?:\s*\(\s*전\s*(\d+(?:\s*-\s*\d+)?)\s*\))?",
+)
 
 _DASH_TRANS = str.maketrans({
     "–": "-",
@@ -1002,11 +1006,65 @@ _DASH_TRANS = str.maketrans({
     "－": "-",
 })
 
-def _normalize_row_cell(s: str) -> str:
-    """순위번호/표시번호 셀에서 하이픈 주변 공백/대시문자 흔들림을 정리."""
+
+def _normalize_row_no(s: str) -> str:
+    """
+    순위번호/표시번호 셀 정규화.
+    - '2[인터넷...]' 같은 잡음을 제거하고 앞의 번호만 남김
+    - 1, 13-2, 1 (전 1), 1-1(전1-1) 등을 허용
+    """
     s = (s or "").translate(_DASH_TRANS)
-    s = re.sub(r"\s*-\s*", "-", s.strip())
-    return s
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\s*-\s*", "-", s)
+
+    m = _ROWNO_EXTRACT_RE.match(s)
+    if not m:
+        # 최소: 앞 숫자만이라도 추출
+        m2 = re.match(r"^\s*(\d+(?:-\d+)?)", s)
+        return m2.group(1) if m2 else s
+
+    base = re.sub(r"\s*-\s*", "-", m.group(1))
+    if m.group(2):
+        sub = re.sub(r"\s*-\s*", "-", m.group(2))
+        return f"{base} (전 {sub})"
+    return base
+
+
+def _normalize_row_cell(s: str) -> str:
+    """(호환) 기존 함수명 유지"""
+    return _normalize_row_no(s)
+
+
+def _clean_registry_cell_text(s: str) -> str:
+    """
+    등기부 표 파싱 시 흔히 붙는 '페이지 하단 안내문/URL' 같은 잡음을 제거.
+    예: '문서 하단의 바코드를 스캐너로 확인하거나, ... https://www.iros.go.kr ...'
+    """
+    s = s or ""
+
+    # URL 제거
+    s = re.sub(r"https?://\S+", "", s)
+    s = re.sub(r"www\.\S+", "", s)
+
+    # 특정 안내문이 포함되면 그 지점부터 잘라냄
+    cut_markers = [
+        "문서 하단",
+        "문서하단",
+        "바코드",
+        "스캐너로",
+        "스캐너",
+        "인터넷등기소",
+        "발급확인 메뉴",
+        "발급확인메뉴",
+        "발급확인",
+    ]
+    for m in cut_markers:
+        idx = s.find(m)
+        if idx != -1:
+            s = s[:idx]
+
+    s = normalize_whitespace(s)
+    return s.strip(" ,;")
 
 
 def _line_text(line: List[Token]) -> str:
@@ -1133,6 +1191,9 @@ def _parse_table_from_lines(
         t = norm_key(s)
         if not t:
             return False
+        # ✅ 페이지 하단 안내문/URL 등 잡음 라인 스킵 (등기부에서 자주 등장)
+        if any(k in t for k in ["인터넷등기소", "바코드", "스캐너", "문서하단", "발급확인메뉴", "irosgokr", "https", "www"]):
+            return True
         if "발급확인번호" in t or "발급일" in t:
             return True
         # 주소+지번이 있고, 표 헤더 키워드는 없는 경우를 page header로 간주
@@ -1188,10 +1249,21 @@ def _parse_table_from_lines(
 
         row = {col_names[i]: normalize_whitespace(values[i]) for i in range(len(col_names))}
 
+        # 셀 텍스트 잡음 제거(페이지 하단 안내문/URL 등)
+        if col_names:
+            for k in col_names[1:]:
+                if row.get(k):
+                    row[k] = _clean_registry_cell_text(row[k])
+
+
         # 첫 컬럼(표시번호/순위번호)은 하이픈 공백 정리
         row_first = _normalize_row_cell(row.get(col_names[0], "")) if col_names else ""
         if col_names:
             row[col_names[0]] = row_first
+
+        # rowno만 있고 나머지가 비어있으면(대부분 페이지 하단 잡음) 스킵
+        if col_names and row.get(col_names[0]) and all(not row.get(k) for k in col_names[1:]):
+            continue
 
         # 이 라인의 페이지 번호(행이 시작한 페이지로 기록)
         if include_page_col:
@@ -1338,9 +1410,40 @@ def extract_registry_land_tables(
             all_lines.extend(p.lines)
 
         # 2) 섹션 마커 위치 찾기(전체 라인 기준)
-        pyo_idx = _find_line_index_contains(all_lines, ("표제부", "표 제 부"))
-        gab_idx = _find_line_index_contains(all_lines, ("갑구", "갑 구"))
-        eul_idx = _find_line_index_contains(all_lines, ("을구", "을 구"))
+        pyo_idx = _find_line_index_contains(all_lines, ("표제부", "표 제 부", "토지의표시", "토지의 표시"))
+        gab_idx = _find_line_index_contains(all_lines, ("갑구", "갑 구", "소유권에관한사항", "소유권에 관한 사항"))
+        eul_idx = _find_line_index_contains(all_lines, ("을구", "을 구", "소유권이외의권리에관한사항", "소유권 이외의 권리에 관한 사항", "소유권이외의권리에관한"))
+
+        # (fallback) '을구' 글자가 OCR에서 누락되는 경우가 있어, 을구 특유 키워드로 시작 지점을 추정
+        if eul_idx is None and gab_idx is not None:
+            eul_kw = ["근저당", "저당권", "전세권", "지상권", "임차권", "가압류", "압류", "가처분", "담보", "가등기"]
+            first_kw = None
+            for i in range(gab_idx + 1, len(all_lines)):
+                s = _line_text(all_lines[i])
+                if any(k in s for k in eul_kw):
+                    first_kw = i
+                    break
+
+            if first_kw is not None:
+                # 근처에서 헤더로 보이는 라인을 찾는다(순위번호/등기목적/접수/등기원인/권리자 3개 이상)
+                def _hdr_hits(line: List[Token]) -> int:
+                    hits = 0
+                    for variants in eul_cols:
+                        if _find_line_index_contains([line], variants) is not None:
+                            hits += 1
+                    return hits
+
+                start = max(gab_idx + 1, first_kw - 35)
+                best_header = None
+                best_hits = -1
+                for j in range(start, min(len(all_lines), first_kw + 1)):
+                    h = _hdr_hits(all_lines[j])
+                    if h > best_hits:
+                        best_hits, best_header = h, j
+
+                if best_header is not None and best_hits >= 3:
+                    # header 직전 라인을 '을구 마커'로 본다 → section이 header부터 시작하도록
+                    eul_idx = best_header - 1
 
         # 3) 을구 종료 마커(매매목록 등) 탐색
         end_markers = ("매매목록", "매 매 목 록", "공동담보목록", "공동 담보 목록", "이하여백", "관할등기소")
@@ -1369,6 +1472,9 @@ def extract_registry_land_tables(
                 include_page_col=True,
                 page_col_name="페이지",
             )
+
+            if (not df_pyo.empty) and ("페이지" in df_pyo.columns):
+                df_pyo["페이지"] = pd.to_numeric(df_pyo["페이지"], errors="coerce").ffill().astype("Int64")
 
             if not df_pyo.empty:
                 df_pyo.insert(0, "지번", pk)
@@ -1428,6 +1534,9 @@ def extract_registry_land_tables(
                 include_page_col=True,
                 page_col_name="페이지",
             )
+            if (not df_gab.empty) and ("페이지" in df_gab.columns):
+                df_gab["페이지"] = pd.to_numeric(df_gab["페이지"], errors="coerce").ffill().astype("Int64")
+
             if not df_gab.empty:
                 df_gab.insert(0, "지번", pk)
                 gab_dfs.append(df_gab)
@@ -1462,10 +1571,51 @@ def extract_registry_land_tables(
                         }]
                     )
 
+            if (not df_eul.empty) and ("페이지" in df_eul.columns):
+                df_eul["페이지"] = pd.to_numeric(df_eul["페이지"], errors="coerce").ffill().astype("Int64")
+
             if not df_eul.empty:
                 df_eul.insert(0, "지번", pk)
                 eul_dfs.append(df_eul)
 
+
+        else:
+            # ✅ 을구 마커가 아예 안 잡힌 경우:
+            # - 실제로 을구가 없어서 '기록사항 없음'일 수도 있고
+            # - OCR 흔들림으로 '을구' 글자만 누락된 경우도 있음
+            # → 최소 1행은 남겨서 "empty"로 보이지 않도록 처리
+            tail_lines = []
+            if gab_idx is not None:
+                tail_lines = all_lines[gab_idx + 1 : min(len(all_lines), gab_idx + 120)]
+            else:
+                tail_lines = all_lines[:120]
+
+            tail_text = "\n".join(_line_text(l) for l in tail_lines)
+            if ("기록사항" in tail_text) and ("없" in tail_text):
+                df_eul = pd.DataFrame(
+                    [{
+                        "페이지": None,
+                        "순위번호": "",
+                        "등기목적": "기록사항 없음",
+                        "접수": "",
+                        "등기원인": "",
+                        "권리자및기타사항": "",
+                    }]
+                )
+            else:
+                df_eul = pd.DataFrame(
+                    [{
+                        "페이지": None,
+                        "순위번호": "",
+                        "등기목적": "을구 섹션 미검출",
+                        "접수": "",
+                        "등기원인": "",
+                        "권리자및기타사항": "",
+                    }]
+                )
+
+            df_eul.insert(0, "지번", pk)
+            eul_dfs.append(df_eul)
     # ---- 최종 DF 구성 ----
     df_check = pd.DataFrame(check_rows) if check_rows else pd.DataFrame(
         columns=["지번", "페이지(표제부)", "토지_소재지번(표제부위)", "표제부_소재지번", "지번추출(표제부위)", "지번추출(표제부)", "일치여부"]
