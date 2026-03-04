@@ -50,7 +50,7 @@ from openpyxl.utils import get_column_letter
 # 0) 앱 설정
 # ============================================================
 APP_TITLE = "문서 비서📄 dev — 토지 등기(표제부+갑구) 정리"
-APP_VERSION = "v0.6.0"
+APP_VERSION = "v0.6.1"
 
 DEFAULT_PASSWORD = "alohomora"  # 데모용
 MAX_PAGES_PER_REQUEST = 10      # Naver General OCR PDF 최대 10페이지/요청
@@ -301,6 +301,17 @@ def parse_tables_and_lines_from_ocr_json(
 
                 if rspan > 1 or cspan > 1:
                     merges.append((r, col, r + rspan - 1, col + cspan - 1))
+
+
+            # 테이블 bbox가 응답에 없을 수 있어 cell bbox로 보강
+            if t_bbox is None:
+                xs0, ys0, xs1, ys1 = [], [], [], []
+                for pc in parsed_cells:
+                    if pc.bbox:
+                        x0, y0, x1, y1 = pc.bbox
+                        xs0.append(x0); ys0.append(y0); xs1.append(x1); ys1.append(y1)
+                if xs0 and ys0 and xs1 and ys1:
+                    t_bbox = (min(xs0), min(ys0), max(xs1), max(ys1))
 
             n_rows = max_r
             n_cols = max_c
@@ -634,11 +645,72 @@ GAB_ONTOLOGY: Dict[str, Dict[str, Any]] = {
 
 def classify_gab_or_eul(table: ParsedTable, page_lines: List[PageLine]) -> str:
     """
-    테이블 bbox 위쪽에서 가장 가까운 텍스트 라인에서 '갑 구/을 구'를 찾아 분류.
-    반환: '갑구' | '을구' | 'unknown'
+    테이블이 '갑구/을구' 중 어디에 속하는지 분류.
+    1) page_lines(일반 OCR 텍스트)에서 테이블 바로 위의 '갑 구/을 구' 라벨을 찾는다.
+    2) 없으면, 테이블 상단 몇 행(grid)에서 라벨을 찾는다.
+    3) 그래도 없으면 unknown.
     """
-    if not table.bbox or not page_lines:
-        return "unknown"
+    # table y0 추정 (bbox가 None이면 cells bbox로 다시 계산)
+    y0 = None
+    if table.bbox:
+        y0 = table.bbox[1]
+    else:
+        ys = []
+        for pc in table.cells:
+            if pc.bbox:
+                ys.append(pc.bbox[1])
+        if ys:
+            y0 = min(ys)
+
+    def is_gab_marker(txt: str) -> bool:
+        n = _norm(txt)
+        # '갑구' 직접 또는 '소유권에 관한 사항' (이외/권리 제외)로 판정
+        if "갑구" in n:
+            return True
+        if "소유권에관한사항" in n and "이외" not in n:
+            return True
+        # OCR 흔들림: '값구','각구' 등
+        if ("값구" in n) or ("각구" in n):
+            return True
+        return False
+
+    def is_eul_marker(txt: str) -> bool:
+        n = _norm(txt)
+        if "을구" in n:
+            return True
+        if "소유권이외의권리에관한사항" in n:
+            return True
+        # OCR 흔들림
+        if "을구" in n:
+            return True
+        return False
+
+    # 1) page_lines 기준: 테이블 위쪽에서 가장 가까운 마커
+    if y0 is not None and page_lines:
+        cand = [ln for ln in page_lines if ln.y < y0]
+        # 가까운 것부터 역순
+        cand.sort(key=lambda ln: ln.y, reverse=True)
+
+        # 우선 가까운 범위(<=800px)에서 찾고, 없으면 전체에서 찾기
+        for max_gap in (800, 2000, 10**9):
+            for ln in cand:
+                if (y0 - ln.y) > max_gap:
+                    break
+                if is_gab_marker(ln.text):
+                    return "갑구"
+                if is_eul_marker(ln.text):
+                    return "을구"
+
+    # 2) table grid 상단에서 라벨 탐색 (가끔 라벨이 테이블 내부로 들어오는 경우)
+    top_rows = min(5, table.n_rows)
+    for r in range(top_rows):
+        row_text = " ".join(table.grid[r])
+        if is_gab_marker(row_text):
+            return "갑구"
+        if is_eul_marker(row_text):
+            return "을구"
+
+    return "unknown"
 
     y0 = table.bbox[1]
     # 테이블 위 260px 범위에서 가장 가까운 라인
@@ -722,6 +794,41 @@ def find_gab_tables(
     return out
 
 
+GAB_PURPOSE_KEYWORDS = [
+    # 갑구(소유권/압류/가처분 등)
+    "소유권", "공유", "압류", "가압류", "가처분", "경매", "환매", "가등기", "신탁", "가처분", "처분금지",
+    "말소", "이전", "변경", "회복", "보존",
+]
+EUL_PURPOSE_KEYWORDS = [
+    # 을구(담보/임차권 등)
+    "근저당", "저당", "전세권", "지상권", "임차권", "지역권", "담보", "질권", "저당권", "근질권",
+]
+
+
+def guess_section_by_purpose_keywords(t: ParsedTable, header_row: int, col_map: Dict[str, int]) -> str:
+    """
+    '등기목적' 텍스트를 보고 갑구/을구를 추정하는 백업 로직.
+    - 소유권/압류/가처분 등 → 갑구 가능성↑
+    - 근저당/전세권/지상권/임차권 등 → 을구 가능성↑
+    """
+    c_purpose = col_map.get("purpose", 1)
+    c_next = col_map.get("acceptance", min(c_purpose + 1, t.n_cols))
+    gab = 0
+    eul = 0
+
+    for r in range(header_row + 1, min(t.n_rows, header_row + 30)):
+        txt = join_cols(t.grid[r], c_purpose, c_next, sep=" ")
+        n = _norm(txt)
+        if not n:
+            continue
+        if any(k in n for k in map(_norm, GAB_PURPOSE_KEYWORDS)):
+            gab += 1
+        if any(k in n for k in map(_norm, EUL_PURPOSE_KEYWORDS)):
+            eul += 1
+
+    if gab == 0 and eul == 0:
+        return "unknown"
+    return "갑구" if gab >= eul else "을구"
 def extract_gab_records_from_table(t: ParsedTable, header_row: int, col_map: Dict[str, int]) -> pd.DataFrame:
     c_rank = col_map["rank"]
     c_purpose = col_map["purpose"]
@@ -1197,8 +1304,12 @@ def process_pdf(
     gab_df_by_group: Dict[str, List[pd.DataFrame]] = {g.key: [] for g in groups}
 
     for (t, header_row, col_map) in gab_candidates:
-        # 페이지 텍스트로 갑/을 구 구분
+        # 1차: 페이지 라벨(갑구/을구) 기반 분류
         section = classify_gab_or_eul(t, all_page_lines.get(t.page_no, []))
+        # 2차: 라벨이 안 잡히면 등기목적 키워드로 추정
+        if section == "unknown":
+            section = guess_section_by_purpose_keywords(t, header_row, col_map)
+
         if section != "갑구":
             continue  # ✅ 지금은 갑구만
 
@@ -1424,10 +1535,11 @@ def _render_group(g: ParcelGroup):
     gab_cols = ["순위번호", "등기목적", "접수", "등기원인", "권리자 및 기타사항"]
     if gab_df.empty:
         st.info("갑구 없음(또는 갑구 표 검출 실패)")
-        st.caption("팁: '갑 구' 라벨이 표 위쪽에 OCR로 잡히지 않으면 갑구로 분류가 안될 수 있어요.")
+        st.caption("팁: '갑 구' 라벨이 OCR로 안 잡혀도, 이제는 등기목적(소유권/근저당 등) 키워드로 2차 추정합니다. 그래도 비면 표 자체가 tables로 검출되지 않았을 가능성이 큽니다.")
     else:
         st.dataframe(gab_df[[c for c in gab_cols if c in gab_df.columns]], use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
     main()
+
