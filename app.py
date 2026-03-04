@@ -1,28 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-문서 비서 📄  (Naver Table OCR → "토지 등기 표제부"만 정리해서 엑셀로)
-============================================================
+문서 비서 📄  (Naver Table OCR → 토지 등기 "표제부" + "갑구" 정리)
+===============================================================
 
-요구사항(사용자 요청):
-- 네이버 CLOVA OCR General + enableTableDetection=true (표추출 OCR) 사용
-- PDF 전체를 OCR 처리한 뒤,
-  "등기사항전부증명서(토지) - 표제부" 테이블만 골라서 보기 좋게 재가공
-- 결과를 "표제부 전용 엑셀"로 따로 다운로드
-- (선택) JSON-LD(간단 온톨로지 그래프)도 함께 다운로드
+✅ 사용자 요구 반영(v0.6.0)
+1) 표제부가 여러 지번(여러 페이지)에 따로 존재하면, **지번별로 표를 분리**해서 보여주고/엑셀 시트도 분리
+2) 갑구도 **지번별로 분리**해서 정리
+   - 컬럼: 순위번호, 등기목적, 접수, 등기원인, 권리자 및 기타사항
+   - 권리자 및 기타사항이 여러 셀/여러 줄로 나뉘는 경우 → 같은 순위번호로 이어붙이기
 
-핵심 아이디어:
-1) Naver가 내려주는 tables/cells(rowIndex, columnIndex, rowSpan, columnSpan)를 그대로 활용한다.
-2) 표제부 후보 테이블은 '헤더 라인'에서
-   [표시번호, 소재지번, 지목, 면적] 컬럼이 함께 나타나는 테이블을 우선으로 잡는다.
-3) 소재지번이 여러 칸으로 쪼개지는 경우가 많아서,
-   "소재지번 col ~ 지목 col 직전"까지를 합쳐서 소재지번으로 만든다.
-   면적도 "면적 col ~ 끝"까지 합친다.
-4) 표시번호가 비어있는 줄은 '이어쓰기(continuation)'로 판단해 이전 행에 병합한다.
+기술 스택
+- 네이버 CLOVA OCR General + enableTableDetection=true (표추출 OCR)
+- 표( tables/cells )는 네이버가 준 rowIndex/columnIndex/Span을 기반으로 복원
+- 표제부/갑구는 "작은 온톨로지(aliases + 정규화 규칙)"로 헤더 인식 및 컬럼 매핑
 
-주의:
-- 표 추출은 도메인 설정에서 "표 추출 여부"가 ON이어야 동작합니다.
-- OCR 결과가 표를 잘못 나누면, 완벽 복원은 불가능합니다.
-  그래도 표제부는 구조가 비교적 단순해서 성공률이 높은 편입니다.
+주의
+- 표 추출은 네이버 콘솔 Domain 설정에서 "표 추출 여부"가 ON이어야 동작합니다.
+- OCR이 표를 잘못 쪼개면 완벽 복원은 불가능하지만, 등기 표제부/갑구는 구조가 비교적 규칙적이라 성공률이 높습니다.
 
 requirements.txt (권장)
 ----------------------
@@ -42,7 +36,7 @@ import time
 import uuid
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -55,12 +49,11 @@ from openpyxl.utils import get_column_letter
 # ============================================================
 # 0) 앱 설정
 # ============================================================
-APP_TITLE = "문서 비서📄 dev — 토지 등기 표제부 전용"
-APP_VERSION = "v0.5.3"
+APP_TITLE = "문서 비서📄 dev — 토지 등기(표제부+갑구) 정리"
+APP_VERSION = "v0.6.0"
 
 DEFAULT_PASSWORD = "alohomora"  # 데모용
 MAX_PAGES_PER_REQUEST = 10      # Naver General OCR PDF 최대 10페이지/요청
-
 MAX_SHEETNAME_LEN = 31
 
 
@@ -76,7 +69,17 @@ def _import_pypdf():
         return PdfReader, PdfWriter
 
 
+def get_pdf_total_pages(pdf_bytes: bytes) -> int:
+    PdfReader, _ = _import_pypdf()
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    return len(reader.pages)
+
+
 def split_pdf_into_chunks(pdf_bytes: bytes, chunk_size: int) -> List[Tuple[bytes, int, int]]:
+    """
+    PDF bytes를 chunk_size 페이지 단위로 쪼개서
+    [(chunk_pdf_bytes, start_page(1-indexed), end_page(1-indexed)), ...] 반환
+    """
     PdfReader, PdfWriter = _import_pypdf()
     reader = PdfReader(io.BytesIO(pdf_bytes))
     total = len(reader.pages)
@@ -132,7 +135,7 @@ def call_naver_ocr_table(
 
 
 # ============================================================
-# 3) OCR 테이블 파싱
+# 3) OCR 테이블 파싱 + 페이지 텍스트라인(갑/을 구 판별용)
 # ============================================================
 @dataclass
 class ParsedCell:
@@ -154,9 +157,15 @@ class ParsedTable:
     bbox: Optional[Tuple[float, float, float, float]]
     n_rows: int
     n_cols: int
-    grid: List[List[str]]               # [r][c] (top-left only if merged)
+    grid: List[List[str]]  # [r][c] (top-left only if merged)
     merges: List[Tuple[int, int, int, int]]  # (r0,c0,r1,c1) 0-based inclusive
     cells: List[ParsedCell]
+
+
+@dataclass
+class PageLine:
+    y: float
+    text: str
 
 
 def _bbox_from_vertices(vertices: List[Dict[str, Any]]) -> Optional[Tuple[float, float, float, float]]:
@@ -186,12 +195,74 @@ def _cell_text(cell: Dict[str, Any]) -> str:
     return "\n".join(out_lines).strip()
 
 
-def parse_tables_from_ocr_json(ocr_json: Dict[str, Any], *, page_numbers: List[int]) -> List[ParsedTable]:
+def _fields_to_page_lines(img: Dict[str, Any], *, y_thresh: float = 14.0) -> List[PageLine]:
+    """
+    OCR fields(일반 텍스트 박스)를 y기준으로 줄 단위로 묶어서 반환.
+    (갑구/을구 구분을 위해 테이블 근처의 텍스트를 찾는 용도)
+    """
+    fields = img.get("fields") or []
+    items = []
+    for f in fields:
+        txt = (f.get("inferText") or "").strip()
+        if not txt:
+            continue
+        verts = ((f.get("boundingPoly") or {}).get("vertices")) or []
+        if not verts:
+            continue
+        x0 = float(verts[0].get("x", 0))
+        y0 = float(verts[0].get("y", 0))
+        items.append((y0, x0, txt))
+
+    if not items:
+        return []
+
+    items.sort(key=lambda x: (x[0], x[1]))
+    lines: List[PageLine] = []
+    cur = []
+    last_y = items[0][0]
+
+    def flush():
+        nonlocal cur
+        if not cur:
+            return
+        cur.sort(key=lambda x: x[1])
+        y_avg = sum(x[0] for x in cur) / len(cur)
+        text = " ".join(x[2] for x in cur).strip()
+        text = re.sub(r"\s+", " ", text)
+        if text:
+            lines.append(PageLine(y=y_avg, text=text))
+        cur = []
+
+    for y0, x0, txt in items:
+        if cur and abs(y0 - last_y) > y_thresh:
+            flush()
+        cur.append((y0, x0, txt))
+        last_y = y0
+
+    flush()
+    return lines
+
+
+def parse_tables_and_lines_from_ocr_json(
+    ocr_json: Dict[str, Any], *, page_numbers: List[int]
+) -> Tuple[List[ParsedTable], Dict[int, List[PageLine]]]:
+    """
+    반환:
+      - tables: ParsedTable 리스트
+      - page_lines: {page_no: [PageLine, ...]} (갑/을 구 판별용)
+    """
     tables_out: List[ParsedTable] = []
+    page_lines: Dict[int, List[PageLine]] = {}
+
     images = ocr_json.get("images", []) if isinstance(ocr_json, dict) else []
 
     for img_idx, img in enumerate(images):
         page_no = page_numbers[img_idx] if img_idx < len(page_numbers) else (img_idx + 1)
+
+        # page lines
+        page_lines[page_no] = _fields_to_page_lines(img)
+
+        # tables
         tables = img.get("tables") or []
         if not tables:
             continue
@@ -213,7 +284,6 @@ def parse_tables_from_ocr_json(ocr_json: Dict[str, Any], *, page_numbers: List[i
                 cspan = int(c.get("columnSpan", 1) or 1)
 
                 txt = _cell_text(c)
-
                 c_bbox = _bbox_from_vertices(((c.get("boundingPoly") or {}).get("vertices")) or [])
 
                 conf = c.get("inferConfidence")
@@ -258,13 +328,39 @@ def parse_tables_from_ocr_json(ocr_json: Dict[str, Any], *, page_numbers: List[i
                 )
             )
 
-    return tables_out
+    return tables_out, page_lines
 
 
 # ============================================================
-# 4) "표제부" 온톨로지(간단) + 추출/정리 로직
+# 4) 공통 유틸/온톨로지(aliases) 기반 헤더 탐지
 # ============================================================
-# (온톨로지 역할) 표제부에서 의미가 있는 필드(개념)와 라벨(동의어/오독)을 정의
+def _norm(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", "", s)
+    return s.lower()
+
+
+def _contains_any(norm_text: str, aliases: List[str]) -> bool:
+    for a in aliases:
+        if _norm(a) and _norm(a) in norm_text:
+            return True
+    return False
+
+
+def join_cols(row: List[str], start: int, end: int, *, sep: str = "\n") -> str:
+    parts: List[str] = []
+    for c in range(start, min(end, len(row))):
+        v = (row[c] or "").strip()
+        if v:
+            parts.append(v)
+    s = sep.join(parts).strip()
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s
+
+
+# ============================================================
+# 5) 표제부 추출/정리
+# ============================================================
 PYO_ONTOLOGY: Dict[str, Dict[str, Any]] = {
     "display_no": {
         "label": "표시번호",
@@ -294,7 +390,6 @@ PYO_ONTOLOGY: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# 지목 통제어휘(간단)
 LAND_CATEGORIES = [
     "전","답","과수원","목장용지","임야","광천지","염전","대","공장용지","학교용지","주차장","주유소용지",
     "창고용지","도로","철도용지","제방","하천","구거","유지","양어장","수도용지","공원","체육용지",
@@ -307,19 +402,6 @@ LAND_CATEGORY_ALIASES = {
 }
 
 
-def _norm(s: str) -> str:
-    s = (s or "").strip()
-    s = re.sub(r"\s+", "", s)
-    return s.lower()
-
-
-def _contains_any(norm_text: str, aliases: List[str]) -> bool:
-    for a in aliases:
-        if _norm(a) and _norm(a) in norm_text:
-            return True
-    return False
-
-
 def normalize_land_category(raw: str) -> str:
     s = (raw or "").strip()
     s2 = re.sub(r"\s+", "", s)
@@ -327,12 +409,10 @@ def normalize_land_category(raw: str) -> str:
         s2 = LAND_CATEGORY_ALIASES[s2]
     if s2 in LAND_CATEGORIES:
         return s2
-    # 약한 fuzzy: 글자 1~2개 차이 정도만 보정 (한글 길이가 짧으므로 보수적으로)
-    # ex) '임야' vs '입야' 같은 경우
+    # 약한 보정(공통 글자수)
     best = ""
     best_score = 0
     for cat in LAND_CATEGORIES:
-        # 공통 글자 수 기반
         score = sum(1 for ch in s2 if ch in cat)
         if score > best_score:
             best_score = score
@@ -342,52 +422,7 @@ def normalize_land_category(raw: str) -> str:
     return s
 
 
-def parse_area_to_number(area_text: str) -> Optional[float]:
-    s = (area_text or "").replace(",", "")
-    m = re.search(r"(\d+(?:\.\d+)?)", s)
-    if not m:
-        return None
-    try:
-        return float(m.group(1))
-    except Exception:
-        return None
-
-
-
-
-def split_area_and_note(area_text: str) -> Tuple[str, str]:
-    """
-    면적 텍스트에서 '숫자+단위(m2/㎡/m²)'를 분리하고,
-    나머지를 '등기원인 및 기타사항'으로 돌려준다.
-
-    예)
-      '1540m2 분할로 인하여 ...' -> ('1540m2', '분할로 인하여 ...')
-      '1,540 ㎡' -> ('1540m2', '')
-      '지목변경' -> ('', '지목변경')  # 면적 패턴이 없으면 note로 처리
-    """
-    s = (area_text or "").strip()
-    if not s:
-        return "", ""
-
-    m = re.search(r"(?i)(\d+(?:,\d+)*(?:\.\d+)?)\s*(m2|m²|㎡)", s)
-    if not m:
-        return "", s
-
-    num_raw = m.group(1)
-    num = num_raw.replace(",", "")
-    area_only = f"{num}m2"
-
-    note = s[m.end():].strip()
-    note = re.sub(r"^[\s:;,.\)\]]+", "", note).strip()
-
-    return area_only, note
-
-
 def extract_lot_no(addr: str) -> str:
-    """
-    소재지번 문자열에서 지번(예: 496-10 / 496) 추출(휴리스틱).
-    - 가장 마지막에 나오는 지번 패턴을 사용
-    """
     s = (addr or "").strip()
     m = re.findall(r"\d{1,5}-\d{1,5}", s)
     if m:
@@ -398,97 +433,79 @@ def extract_lot_no(addr: str) -> str:
     return ""
 
 
+def split_area_and_note(area_text: str) -> Tuple[str, str]:
+    """
+    면적 텍스트에서 '숫자+단위(m2/㎡/m²)'를 분리하고,
+    나머지를 '등기원인 및 기타사항'으로 돌려준다.
+    """
+    s = (area_text or "").strip()
+    if not s:
+        return "", ""
+
+    m = re.search(r"(?i)(\d+(?:,\d+)*(?:\.\d+)?)\s*(m2|m²|㎡)", s)
+    if not m:
+        return "", s
+
+    num = (m.group(1) or "").replace(",", "")
+    area_only = f"{num}m2"
+
+    note = s[m.end():].strip()
+    note = re.sub(r"^[\s:;,.\)\]]+", "", note).strip()
+    return area_only, note
+
+
 def find_pyo_tables(tables: List[ParsedTable]) -> List[Tuple[ParsedTable, int, Dict[str, int]]]:
-    """
-    표제부 후보 테이블 탐색.
-    반환: [(table, header_row_index, col_map), ...]
-      - header_row_index: 헤더로 판단된 행 인덱스
-      - col_map: {'display_no': c, 'lot_address': c, 'land_category': c, 'area': c}
-    """
     out: List[Tuple[ParsedTable, int, Dict[str, int]]] = []
 
     for t in tables:
-        # 너무 작은 표는 제외(노이즈)
         if t.n_rows < 2 or t.n_cols < 3:
             continue
 
-        # 각 행에서 "헤더" 찾기
         header_row = -1
-        header_hits: Dict[str, int] = {}
-
-        for r in range(min(t.n_rows, 8)):  # 헤더는 보통 상단에 있음
-            row_texts = [t.grid[r][c] for c in range(t.n_cols)]
-            row_norm = _norm(" ".join(row_texts))
-
-            hits = {}
-            for key, spec in PYO_ONTOLOGY.items():
-                if _contains_any(row_norm, spec["aliases"]):
-                    hits[key] = 1
-
-            # 표제부 헤더 조건: 표시번호 + (소재지번/지목/면적 중 2개 이상)
-            cond = ("display_no" in hits) and (len(hits) >= 3)
-            if cond:
+        for r in range(min(t.n_rows, 8)):
+            row_norm = _norm(" ".join(t.grid[r]))
+            hits = {k: 1 for k, spec in PYO_ONTOLOGY.items() if _contains_any(row_norm, spec["aliases"])}
+            if ("display_no" in hits) and (len(hits) >= 3):
                 header_row = r
-                header_hits = hits
                 break
 
         if header_row < 0:
             continue
 
-        # 헤더행에서 컬럼 매핑
         col_map: Dict[str, int] = {}
         for c in range(t.n_cols):
             cell_norm = _norm(t.grid[header_row][c])
 
-            # 표시번호
             if "display_no" not in col_map and _contains_any(cell_norm, PYO_ONTOLOGY["display_no"]["aliases"]):
                 col_map["display_no"] = c
                 continue
-
-            # 접수
             if "acceptance" not in col_map and _contains_any(cell_norm, PYO_ONTOLOGY["acceptance"]["aliases"]):
                 col_map["acceptance"] = c
                 continue
-
-            # 소재지번
             if "lot_address" not in col_map and _contains_any(cell_norm, PYO_ONTOLOGY["lot_address"]["aliases"]):
                 col_map["lot_address"] = c
                 continue
-
-            # 지목
             if "land_category" not in col_map and _contains_any(cell_norm, PYO_ONTOLOGY["land_category"]["aliases"]):
                 col_map["land_category"] = c
                 continue
-
-            # 면적
             if "area" not in col_map and _contains_any(cell_norm, PYO_ONTOLOGY["area"]["aliases"]):
                 col_map["area"] = c
                 continue
 
-        # fallback: 헤더 텍스트가 합쳐져 있으면 순서로 추정
-        # (표제부 표는 대개 표시번호-소재지번-지목-면적 순)
+        # fallback
         if "display_no" not in col_map:
             col_map["display_no"] = 0
-
-        # 소재지번/지목/면적의 위치가 안 잡히면 제외
         if "land_category" not in col_map or "area" not in col_map:
             continue
         if "lot_address" not in col_map:
-            # 소재지번은 지목 앞쪽에 있을 확률이 큼
             col_map["lot_address"] = max(0, min(col_map["land_category"] - 1, t.n_cols - 1))
-
-
-        # 접수 컬럼이 없으면 (표시번호 다음)으로 보수적 추정
         if "acceptance" not in col_map:
-            # 표시번호 다음 칸이 소재지번보다 왼쪽에 있으면 접수로 간주
             cand = col_map.get("display_no", 0) + 1
-            if cand < col_map.get("lot_address", cand + 1):
-                if cand < t.n_cols:
-                    col_map["acceptance"] = cand
+            if cand < col_map.get("lot_address", cand + 1) and cand < t.n_cols:
+                col_map["acceptance"] = cand
 
-        # sanity: 순서 강제(오탐 방지)
+        # sanity (표제부는 보통 표시번호 < 지목 < 면적)
         if not (col_map["display_no"] < col_map["land_category"] < col_map["area"]):
-            # 구조가 다르면 표제부 아닐 가능성
             continue
 
         out.append((t, header_row, col_map))
@@ -496,16 +513,7 @@ def find_pyo_tables(tables: List[ParsedTable]) -> List[Tuple[ParsedTable, int, D
     return out
 
 
-def extract_pyo_records_from_table(
-    t: ParsedTable,
-    header_row: int,
-    col_map: Dict[str, int],
-) -> pd.DataFrame:
-    """
-    표제부 테이블 하나를 '정리된' 레코드 테이블로 변환.
-    반환 컬럼:
-      - 페이지, table_id, 표시번호, 소재지번, 지번, 지목, 면적, 면적_숫자
-    """
+def extract_pyo_records_from_table(t: ParsedTable, header_row: int, col_map: Dict[str, int]) -> pd.DataFrame:
     c_disp = col_map["display_no"]
     c_acc = col_map.get("acceptance")
     c_addr = col_map["lot_address"]
@@ -517,7 +525,6 @@ def extract_pyo_records_from_table(
 
     for r in range(header_row + 1, t.n_rows):
         row = t.grid[r]
-        # 완전 빈 행 skip
         if all((not (row[c] or "").strip()) for c in range(t.n_cols)):
             continue
 
@@ -526,76 +533,40 @@ def extract_pyo_records_from_table(
         if disp and _contains_any(_norm(disp), ["표제부", "갑구", "을구", "순위번호"]):
             continue
 
-        # 접수: 접수 col ~ 소재지번 직전까지 합치기(접수가 여러 칸으로 쪼개지는 경우 대비)
+        # 접수: 접수 col ~ 소재지번 직전
         acc_text = ""
         if c_acc is not None and 0 <= c_acc < t.n_cols:
-            end_c = c_addr
-            if c_acc < end_c:
-                acc_parts = []
-                for c in range(c_acc, end_c):
-                    if c < 0 or c >= t.n_cols:
-                        continue
-                    v = (row[c] or "").strip()
-                    if v:
-                        acc_parts.append(v)
-                acc_text = "\n".join(acc_parts).strip()
+            if c_acc < c_addr:
+                acc_text = join_cols(row, c_acc, c_addr, sep="\n")
             else:
                 acc_text = (row[c_acc] or "").strip()
 
-        # 소재지번: 소재지번 col ~ 지목 직전까지 합치기
-        addr_parts = []
-        for c in range(c_addr, c_cat):
-            if c < 0 or c >= t.n_cols:
-                continue
-            v = (row[c] or "").strip()
-            if v:
-                addr_parts.append(v)
-        lot_addr = "\n".join(addr_parts).strip()
+        # 소재지번: 소재지번 col ~ 지목 직전
+        lot_addr = join_cols(row, c_addr, c_cat, sep="\n")
 
-        # 지목: 지목 col ~ 면적 직전까지 합치기(지목이 쪼개지는 경우 대비)
-        cat_parts = []
-        for c in range(c_cat, c_area):
-            if c < 0 or c >= t.n_cols:
-                continue
-            v = (row[c] or "").strip()
-            if v:
-                cat_parts.append(v)
-        land_cat_raw = " ".join(cat_parts).strip()
+        # 지목: 지목 col ~ 면적 직전
+        land_cat_raw = join_cols(row, c_cat, c_area, sep=" ")
 
-        # 면적: 면적 col ~ 끝까지 합치기
-        area_parts = []
-        for c in range(c_area, t.n_cols):
-            v = (row[c] or "").strip()
-            if v:
-                area_parts.append(v)
-        area_text_raw = " ".join(area_parts).strip()
-
-        # 면적 / 등기원인 및 기타사항 분리
+        # 면적: 면적 col ~ 끝
+        area_text_raw = join_cols(row, c_area, t.n_cols, sep=" ")
         area_only, note_text = split_area_and_note(area_text_raw)
 
-        # continuation row 판단: 표시번호가 없고, 어떤 값이 있으면 이전 행에 이어붙이기
-        is_continuation = (not disp) and (acc_text or lot_addr or land_cat_raw or area_only or note_text)
-
-        if is_continuation and cur is not None:
+        is_cont = (not disp) and (acc_text or lot_addr or land_cat_raw or area_only or note_text)
+        if is_cont and cur is not None:
+            if acc_text:
+                cur["접수"] = (cur["접수"] + "\n" + acc_text).strip() if cur["접수"] else acc_text
             if lot_addr:
                 cur["소재지번"] = (cur["소재지번"] + "\n" + lot_addr).strip() if cur["소재지번"] else lot_addr
             if land_cat_raw:
-                cur["지목_raw"] = (cur["지목_raw"] + " " + land_cat_raw).strip() if cur["지목_raw"] else land_cat_raw
-            if area_only:
-                # 면적이 비어있으면 채우고, 이미 있으면 보수적으로 유지
-                if not cur.get("면적"):
-                    cur["면적"] = area_only
+                cur["_지목_raw"] = (cur["_지목_raw"] + " " + land_cat_raw).strip() if cur["_지목_raw"] else land_cat_raw
+            if area_only and not cur.get("면적"):
+                cur["면적"] = area_only
             if note_text:
                 cur["등기원인 및 기타사항"] = (
                     (cur.get("등기원인 및 기타사항") or "").strip() + "\n" + note_text
                 ).strip() if (cur.get("등기원인 및 기타사항") or "").strip() else note_text
-            if acc_text:
-                cur["접수"] = (
-                    (cur.get("접수") or "").strip() + "\n" + acc_text
-                ).strip() if (cur.get("접수") or "").strip() else acc_text
             continue
 
-        # 새 레코드 시작 조건: 표시번호가 숫자로 시작하거나(1,2,3) / 5-1 같은 패턴
         if disp:
             cur = {
                 "페이지": t.page_no,
@@ -603,41 +574,299 @@ def extract_pyo_records_from_table(
                 "표시번호": disp,
                 "접수": acc_text,
                 "소재지번": lot_addr,
-                "지목_raw": land_cat_raw,
+                "_지목_raw": land_cat_raw,
                 "면적": area_only,
                 "등기원인 및 기타사항": note_text,
             }
             records.append(cur)
-        else:
-            # 표시번호가 없는데 continuation도 아니면 일단 skip
-            continue
 
     df = pd.DataFrame(records)
-
     if df.empty:
         return df
 
-    # 지번 추출
     df["지번"] = df["소재지번"].apply(extract_lot_no)
+    df["지목"] = df["_지목_raw"].apply(normalize_land_category)
+    df = df.drop(columns=["_지목_raw"], errors="ignore")
 
-    # 지목 정규화
-    df["지목"] = df["지목_raw"].apply(normalize_land_category)
+    # 정렬(표시번호)
+    def disp_key(x: Any) -> Tuple[int, int, str]:
+        s = str(x or "").strip()
+        m = re.match(r"^(\d+)(?:-(\d+))?", s)
+        if not m:
+            return (10**9, 0, s)
+        a = int(m.group(1))
+        b = int(m.group(2) or 0)
+        return (a, b, s)
 
-    # 면적 숫자(㎡)는 내부 계산용(필요하면)
-    # df["_면적_숫자"] = df["면적"].apply(parse_area_to_number)
+    df["_k1"] = df["표시번호"].apply(disp_key)
+    df = df.sort_values("_k1").drop(columns=["_k1"])
 
-    # 보기 좋게 컬럼 순서
     cols = ["페이지", "table_id", "표시번호", "접수", "소재지번", "지번", "지목", "면적", "등기원인 및 기타사항"]
-    df = df[[c for c in cols if c in df.columns]]
-
-    return df
+    return df[[c for c in cols if c in df.columns]]
 
 
 # ============================================================
-# 5) 엑셀 생성 (표제부 전용)
+# 6) 갑구 추출/정리
+# ============================================================
+GAB_ONTOLOGY: Dict[str, Dict[str, Any]] = {
+    "rank": {
+        "label": "순위번호",
+        "aliases": ["순위번호", "순위 번호", "순 위 번 호", "순위", "순위No", "순위NO"],
+    },
+    "purpose": {
+        "label": "등기목적",
+        "aliases": ["등기목적", "등기 목적", "등 기 목 적"],
+    },
+    "acceptance": {
+        "label": "접수",
+        "aliases": ["접수", "접 수", "접수일자", "접수번호"],
+    },
+    "cause": {
+        "label": "등기원인",
+        "aliases": ["등기원인", "등기 원인", "등 기 원 인"],
+    },
+    "holder": {
+        "label": "권리자 및 기타사항",
+        "aliases": ["권리자및기타사항", "권리자 및 기타사항", "권리자및 기타사항", "권리자 및기타사항", "권리자 및 기타 사항"],
+    },
+}
+
+
+def classify_gab_or_eul(table: ParsedTable, page_lines: List[PageLine]) -> str:
+    """
+    테이블 bbox 위쪽에서 가장 가까운 텍스트 라인에서 '갑 구/을 구'를 찾아 분류.
+    반환: '갑구' | '을구' | 'unknown'
+    """
+    if not table.bbox or not page_lines:
+        return "unknown"
+
+    y0 = table.bbox[1]
+    # 테이블 위 260px 범위에서 가장 가까운 라인
+    cand = [ln for ln in page_lines if ln.y < y0 and (y0 - ln.y) <= 260]
+    if not cand:
+        return "unknown"
+    cand.sort(key=lambda ln: ln.y, reverse=True)
+    text_norm = _norm(cand[0].text)
+
+    if "갑구" in text_norm or ("갑" in text_norm and "구" in text_norm and "을구" not in text_norm):
+        return "갑구"
+    if "을구" in text_norm or ("을" in text_norm and "구" in text_norm):
+        return "을구"
+    return "unknown"
+
+
+def find_gab_tables(
+    tables: List[ParsedTable],
+) -> List[Tuple[ParsedTable, int, Dict[str, int]]]:
+    """
+    '순위번호/등기목적/접수/등기원인/권리자및기타사항' 헤더가 있는 테이블 후보 탐색
+    (갑구/을구 공통 구조라서, 실제 갑/을 구 판별은 page_lines + bbox로 추가 분류)
+    """
+    out: List[Tuple[ParsedTable, int, Dict[str, int]]] = []
+
+    for t in tables:
+        if t.n_rows < 2 or t.n_cols < 4:
+            continue
+
+        header_row = -1
+        for r in range(min(t.n_rows, 10)):
+            row_norm = _norm(" ".join(t.grid[r]))
+            hits = {k: 1 for k, spec in GAB_ONTOLOGY.items() if _contains_any(row_norm, spec["aliases"])}
+            # 최소 조건: 순위번호 + 권리자 + 접수 + 등기목적 중 3~4개
+            if ("rank" in hits) and ("holder" in hits) and (len(hits) >= 4 or ("purpose" in hits and "acceptance" in hits)):
+                header_row = r
+                break
+        if header_row < 0:
+            continue
+
+        col_map: Dict[str, int] = {}
+        for c in range(t.n_cols):
+            cell_norm = _norm(t.grid[header_row][c])
+
+            if "rank" not in col_map and _contains_any(cell_norm, GAB_ONTOLOGY["rank"]["aliases"]):
+                col_map["rank"] = c
+                continue
+            if "purpose" not in col_map and _contains_any(cell_norm, GAB_ONTOLOGY["purpose"]["aliases"]):
+                col_map["purpose"] = c
+                continue
+            if "acceptance" not in col_map and _contains_any(cell_norm, GAB_ONTOLOGY["acceptance"]["aliases"]):
+                col_map["acceptance"] = c
+                continue
+            if "cause" not in col_map and _contains_any(cell_norm, GAB_ONTOLOGY["cause"]["aliases"]):
+                col_map["cause"] = c
+                continue
+            if "holder" not in col_map and _contains_any(cell_norm, GAB_ONTOLOGY["holder"]["aliases"]):
+                col_map["holder"] = c
+                continue
+
+        # fallback (일반적인 컬럼 순서)
+        col_map.setdefault("rank", 0)
+        col_map.setdefault("purpose", 1)
+        col_map.setdefault("acceptance", min(2, t.n_cols - 1))
+        col_map.setdefault("cause", min(3, t.n_cols - 1))
+        col_map.setdefault("holder", min(4, t.n_cols - 1))
+
+        # 순서 보정: rank < purpose < acceptance < cause < holder
+        # 만약 뒤죽박죽이면 오탐일 가능성이 높아서 제외
+        try:
+            if not (col_map["rank"] <= col_map["purpose"] <= col_map["acceptance"] <= col_map["cause"] <= col_map["holder"]):
+                # 그래도 holder가 맨 끝에 오도록 강제
+                col_map["holder"] = max(col_map["holder"], col_map["cause"], col_map["acceptance"], col_map["purpose"])
+                if col_map["holder"] >= t.n_cols:
+                    col_map["holder"] = t.n_cols - 1
+        except Exception:
+            continue
+
+        out.append((t, header_row, col_map))
+
+    return out
+
+
+def extract_gab_records_from_table(t: ParsedTable, header_row: int, col_map: Dict[str, int]) -> pd.DataFrame:
+    c_rank = col_map["rank"]
+    c_purpose = col_map["purpose"]
+    c_acc = col_map["acceptance"]
+    c_cause = col_map["cause"]
+    c_holder = col_map["holder"]
+
+    records: List[Dict[str, Any]] = []
+    cur: Optional[Dict[str, Any]] = None
+
+    for r in range(header_row + 1, t.n_rows):
+        row = t.grid[r]
+        if all((not (row[c] or "").strip()) for c in range(t.n_cols)):
+            continue
+
+        rank = (row[c_rank] or "").strip()
+
+        # 잡음/헤더 반복 제거
+        if rank and _contains_any(_norm(rank), ["순위번호", "갑구", "을구", "표제부"]):
+            continue
+
+        purpose = join_cols(row, c_purpose, c_acc, sep="\n") if c_purpose < c_acc else (row[c_purpose] or "").strip()
+        acc = join_cols(row, c_acc, c_cause, sep="\n") if c_acc < c_cause else (row[c_acc] or "").strip()
+        cause = join_cols(row, c_cause, c_holder, sep="\n") if c_cause < c_holder else (row[c_cause] or "").strip()
+        holder = join_cols(row, c_holder, t.n_cols, sep="\n")
+
+        # continuation: 순위번호가 비어있고 내용이 있으면 이전 레코드에 병합
+        is_cont = (not rank) and (purpose or acc or cause or holder)
+        if is_cont and cur is not None:
+            if purpose:
+                cur["등기목적"] = (cur["등기목적"] + "\n" + purpose).strip() if cur["등기목적"] else purpose
+            if acc:
+                cur["접수"] = (cur["접수"] + "\n" + acc).strip() if cur["접수"] else acc
+            if cause:
+                cur["등기원인"] = (cur["등기원인"] + "\n" + cause).strip() if cur["등기원인"] else cause
+            if holder:
+                cur["권리자 및 기타사항"] = (
+                    (cur.get("권리자 및 기타사항") or "").strip() + "\n" + holder
+                ).strip() if (cur.get("권리자 및 기타사항") or "").strip() else holder
+            continue
+
+        if rank:
+            cur = {
+                "페이지": t.page_no,
+                "table_id": t.table_id,
+                "순위번호": rank,
+                "등기목적": purpose,
+                "접수": acc,
+                "등기원인": cause,
+                "권리자 및 기타사항": holder,
+            }
+            records.append(cur)
+
+    df = pd.DataFrame(records)
+    if df.empty:
+        return df
+
+    # 정렬(순위번호)
+    def rank_key(x: Any) -> Tuple[int, int, str]:
+        s = str(x or "").strip()
+        m = re.match(r"^(\d+)(?:-(\d+))?", s)
+        if not m:
+            return (10**9, 0, s)
+        a = int(m.group(1))
+        b = int(m.group(2) or 0)
+        return (a, b, s)
+
+    df["_rk"] = df["순위번호"].apply(rank_key)
+    df = df.sort_values("_rk").drop(columns=["_rk"])
+
+    cols = ["페이지", "table_id", "순위번호", "등기목적", "접수", "등기원인", "권리자 및 기타사항"]
+    return df[[c for c in cols if c in df.columns]]
+
+
+# ============================================================
+# 7) 지번(필지)별 그룹핑
+# ============================================================
+@dataclass
+class ParcelGroup:
+    key: str
+    start_page: int
+    end_page: int
+    pyo_tables: List[ParsedTable] = field(default_factory=list)
+    pyo_df: pd.DataFrame = field(default_factory=pd.DataFrame)
+    gab_tables: List[ParsedTable] = field(default_factory=list)
+    gab_df: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+
+def _pick_group_key_from_pyo_df(df: pd.DataFrame, fallback: str) -> str:
+    if "지번" in df.columns:
+        vals = [str(v).strip() for v in df["지번"].tolist() if str(v).strip()]
+        if vals:
+            return vals[0]
+    return fallback
+
+
+def group_parcels_from_pyo(
+    pyo_items: List[Tuple[ParsedTable, pd.DataFrame]],
+    total_pages: int,
+) -> List[ParcelGroup]:
+    """
+    표제부 결과를 기반으로 지번별 그룹을 만들고, 페이지 범위를 추정한다.
+    - start_page: 해당 지번의 표제부가 처음 등장한 페이지
+    - end_page: 다음 지번 start_page - 1 (마지막은 total_pages)
+    """
+    tmp: Dict[str, Dict[str, Any]] = {}
+    for t, df in pyo_items:
+        key = _pick_group_key_from_pyo_df(df, fallback=t.table_id)
+        g = tmp.setdefault(key, {"start": t.page_no, "tables": [], "dfs": []})
+        g["start"] = min(g["start"], t.page_no)
+        g["tables"].append(t)
+        g["dfs"].append(df)
+
+    groups: List[ParcelGroup] = []
+    for key, g in tmp.items():
+        pyo_df = pd.concat(g["dfs"], ignore_index=True) if g["dfs"] else pd.DataFrame()
+        pyo_df = pyo_df.drop_duplicates()
+        groups.append(ParcelGroup(key=key, start_page=int(g["start"]), end_page=total_pages, pyo_tables=g["tables"], pyo_df=pyo_df))
+
+    groups.sort(key=lambda x: x.start_page)
+
+    # end_page 계산
+    for i in range(len(groups)):
+        if i < len(groups) - 1:
+            groups[i].end_page = max(groups[i].start_page, groups[i + 1].start_page - 1)
+        else:
+            groups[i].end_page = total_pages
+
+    return groups
+
+
+def assign_table_to_group(groups: List[ParcelGroup], page_no: int) -> Optional[ParcelGroup]:
+    for g in groups:
+        if g.start_page <= page_no <= g.end_page:
+            return g
+    return None
+
+
+# ============================================================
+# 8) Excel 생성 (지번별 시트 분리)
 # ============================================================
 def _safe_sheet_name(name: str, used: set) -> str:
-    n = re.sub(r"[\[\]\*:/\\\?]", "_", name)
+    n = re.sub(r"[\[\]\*:/\\\?]", "_", name).strip()
+    if not n:
+        n = "sheet"
     n = n[:MAX_SHEETNAME_LEN]
     if n not in used:
         used.add(n)
@@ -661,90 +890,109 @@ def _autosize(ws, max_col: int, max_row: int):
                 continue
             s = str(v)
             max_len = max(max_len, max((len(line) for line in s.splitlines()), default=len(s)))
-        ws.column_dimensions[letter].width = min(70, max(10, max_len + 2))
+        ws.column_dimensions[letter].width = min(80, max(10, max_len + 2))
 
 
-def build_pyo_excel_bytes(
+def _write_df(ws, df: pd.DataFrame):
+    wrap = Alignment(wrap_text=True, vertical="top")
+    ws.append(list(df.columns))
+    for _, r in df.iterrows():
+        ws.append([r.get(c, "") for c in df.columns])
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+        for cell in row:
+            cell.alignment = wrap
+    _autosize(ws, ws.max_column, ws.max_row)
+
+
+def build_registry_excel_bytes(
     *,
-    pyo_df: pd.DataFrame,
-    pyo_tables: List[ParsedTable],
-    merge_cells: bool = True,
-    include_raw_tables: bool = True,
+    groups: List[ParcelGroup],
+    include_raw_pyo: bool,
+    include_raw_gab: bool,
+    merge_cells_on_raw: bool,
 ) -> bytes:
     wb = Workbook()
-    ws_summary = wb.active
-    ws_summary.title = "표제부_정리"
+    ws_index = wb.active
+    ws_index.title = "INDEX"
+    ws_index.append(["지번(그룹)", "페이지범위", "표제부 행수", "갑구 행수", "표제부 테이블 수", "갑구 테이블 수"])
 
-    wrap = Alignment(wrap_text=True, vertical="top")
+    used = {"INDEX"}
 
-    # 1) 정리 시트 (DataFrame)
-    if pyo_df.empty:
-        ws_summary.append(["표제부를 찾지 못했습니다."])
-    else:
-        ws_summary.append(list(pyo_df.columns))
-        for _, row in pyo_df.iterrows():
-            ws_summary.append([row.get(c, "") for c in pyo_df.columns])
+    # 그룹별 시트
+    for g in groups:
+        # index row
+        ws_index.append([
+            g.key,
+            f"{g.start_page}-{g.end_page}",
+            int(len(g.pyo_df)) if isinstance(g.pyo_df, pd.DataFrame) else 0,
+            int(len(g.gab_df)) if isinstance(g.gab_df, pd.DataFrame) else 0,
+            len(g.pyo_tables),
+            len(g.gab_tables),
+        ])
 
-        # wrap
-        for row in ws_summary.iter_rows(min_row=1, max_row=ws_summary.max_row, min_col=1, max_col=ws_summary.max_column):
-            for cell in row:
-                cell.alignment = wrap
+        # 표제부 시트
+        pyo_df = g.pyo_df if isinstance(g.pyo_df, pd.DataFrame) else pd.DataFrame()
+        pyo_cols_clean = ["표시번호", "접수", "소재지번", "지목", "면적", "등기원인 및 기타사항"]
+        pyo_export = pyo_df[[c for c in pyo_cols_clean if c in pyo_df.columns]].copy() if not pyo_df.empty else pd.DataFrame(columns=pyo_cols_clean)
+        ws_pyo = wb.create_sheet(_safe_sheet_name(f"표제부_{g.key}", used))
+        if pyo_export.empty:
+            ws_pyo.append(["표제부 없음"])
+        else:
+            _write_df(ws_pyo, pyo_export)
 
-        _autosize(ws_summary, ws_summary.max_column, ws_summary.max_row)
+        # 갑구 시트
+        gab_df = g.gab_df if isinstance(g.gab_df, pd.DataFrame) else pd.DataFrame()
+        gab_cols_clean = ["순위번호", "등기목적", "접수", "등기원인", "권리자 및 기타사항"]
+        gab_export = gab_df[[c for c in gab_cols_clean if c in gab_df.columns]].copy() if not gab_df.empty else pd.DataFrame(columns=gab_cols_clean)
+        ws_gab = wb.create_sheet(_safe_sheet_name(f"갑구_{g.key}", used))
+        if gab_export.empty:
+            ws_gab.append(["갑구 없음"])
+        else:
+            _write_df(ws_gab, gab_export)
 
-    # 2) index 시트
-    ws_index = wb.create_sheet("index")
-    ws_index.append(["sheet_name", "page", "table_id", "rows", "cols", "bbox(x0,y0,x1,y1)"])
-    used = {"표제부_정리", "index"}
+        # raw tables (선택)
+        wrap = Alignment(wrap_text=True, vertical="top")
 
-    # 3) raw table sheets (선택)
-    if include_raw_tables:
-        for t in pyo_tables:
-            bbox_s = ""
-            if t.bbox:
-                bbox_s = f"{t.bbox[0]:.1f},{t.bbox[1]:.1f},{t.bbox[2]:.1f},{t.bbox[3]:.1f}"
-            sheet_name = _safe_sheet_name(f"raw_{t.table_id}", used)
-            ws_index.append([sheet_name, t.page_no, t.table_id, t.n_rows, t.n_cols, bbox_s])
-
-            ws = wb.create_sheet(sheet_name)
-
-            # write grid
+        def write_raw_table(t: ParsedTable, sheet_prefix: str):
+            sname = _safe_sheet_name(f"{sheet_prefix}_{t.table_id}", used)
+            ws = wb.create_sheet(sname)
             for r in range(t.n_rows):
                 ws.append(t.grid[r])
-
-            # wrap
             for row in ws.iter_rows(min_row=1, max_row=t.n_rows, min_col=1, max_col=t.n_cols):
                 for cell in row:
                     cell.alignment = wrap
-
-            # merge cells
-            if merge_cells:
+            if merge_cells_on_raw:
                 for (r0, c0, r1, c1) in t.merges:
                     ws.merge_cells(start_row=r0 + 1, start_column=c0 + 1, end_row=r1 + 1, end_column=c1 + 1)
-
             _autosize(ws, t.n_cols, t.n_rows)
 
-    # 저장
+        if include_raw_pyo:
+            for t in g.pyo_tables:
+                write_raw_table(t, "rawPYO")
+
+        if include_raw_gab:
+            for t in g.gab_tables:
+                write_raw_table(t, "rawGAB")
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
 
 # ============================================================
-# 6) (선택) JSON-LD(온톨로지 그래프) — 표제부만
+# 9) JSON-LD(온톨로지) — 표제부 + 갑구
 # ============================================================
-def build_pyo_jsonld(
+def build_registry_jsonld(
     *,
     file_name: str,
     file_hash: str,
-    pyo_df: pd.DataFrame,
+    groups: List[ParcelGroup],
     base_iri: str = "urn:dovi:",
-    generator: str = "DOVI-PYO",
+    generator: str = "DOVI-REGISTRY",
 ) -> Dict[str, Any]:
     """
-    간단 JSON-LD:
-    Document -> Parcel -> Fact
-    + evidence로 page/table_id를 Fact에 남김
+    매우 단순한 JSON-LD 그래프:
+      Document -> Parcel -> Facts(표제부) + GabEntry(갑구 항목)
     """
     base = base_iri if base_iri.endswith(("/", "#", ":")) else base_iri + ":"
     doc_id = f"{base}document:{file_hash}"
@@ -754,12 +1002,13 @@ def build_pyo_jsonld(
         "dovi": "https://example.org/dovi#",
         "schema": "https://schema.org/",
         "xsd": "http://www.w3.org/2001/XMLSchema#",
-
         "id": "@id",
         "type": "@type",
+
         "Document": "dovi:Document",
         "Parcel": "dovi:Parcel",
         "Fact": "dovi:Fact",
+        "GabEntry": "dovi:GabEntry",
 
         "fileName": "schema:name",
         "fileHash": "dovi:fileHash",
@@ -768,16 +1017,19 @@ def build_pyo_jsonld(
 
         "mentionsParcel": {"@id": "dovi:mentionsParcel", "@type": "@id"},
         "hasFact": {"@id": "dovi:hasFact", "@type": "@id"},
+        "hasGabEntry": {"@id": "dovi:hasGabEntry", "@type": "@id"},
 
         "lot": "dovi:lot",
         "siteAddress": "dovi:siteAddress",
 
         "field": "dovi:field",
         "value": "dovi:value",
-        "valueNumber": {"@id": "dovi:valueNumber", "@type": "xsd:decimal"},
-        "unit": "dovi:unit",
-        "evidencePage": {"@id": "dovi:evidencePage", "@type": "xsd:integer"},
-        "evidenceTable": "dovi:evidenceTable",
+
+        "rankNo": "dovi:rankNo",
+        "purpose": "dovi:purpose",
+        "acceptance": "dovi:acceptance",
+        "cause": "dovi:cause",
+        "holderNote": "dovi:holderNote",
     }
 
     def now_iso():
@@ -795,70 +1047,63 @@ def build_pyo_jsonld(
     }
     graph.append(doc_node)
 
-    if pyo_df is None or pyo_df.empty:
-        return {"@context": context, "@graph": graph}
-
-    def pid_for(lot: str, addr: str) -> str:
-        key = (addr or "") + "|" + (lot or "")
+    def parcel_id(key: str) -> str:
         hid = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
         return f"{doc_id}#parcel-{hid}"
 
-    for _, row in pyo_df.iterrows():
-        addr = str(row.get("소재지번", "") or "")
-        lot = str(row.get("지번", "") or "")
-        pid = pid_for(lot, addr)
+    for g in groups:
+        pid = parcel_id(g.key)
+        doc_node["mentionsParcel"].append(pid)
 
-        if pid not in doc_node["mentionsParcel"]:
-            doc_node["mentionsParcel"].append(pid)
-            graph.append(
-                {
-                    "@id": pid,
-                    "@type": "Parcel",
-                    "lot": lot,
-                    "siteAddress": addr,
-                    "hasFact": [],
-                }
-            )
+        # 표제부에서 대표 주소(첫 행) 가져오기
+        addr = ""
+        if isinstance(g.pyo_df, pd.DataFrame) and not g.pyo_df.empty and "소재지번" in g.pyo_df.columns:
+            addr = str(g.pyo_df.iloc[0].get("소재지번", "") or "")
 
-        # parcel node ref
-        parcel_node = next(n for n in graph if n.get("@id") == pid)
+        parcel_node: Dict[str, Any] = {
+            "@id": pid,
+            "@type": "Parcel",
+            "lot": g.key,
+            "siteAddress": addr,
+            "hasFact": [],
+            "hasGabEntry": [],
+        }
+        graph.append(parcel_node)
 
-        page = row.get("페이지")
-        table_id = row.get("table_id")
+        # 표제부 Facts
+        if isinstance(g.pyo_df, pd.DataFrame) and not g.pyo_df.empty:
+            for _, row in g.pyo_df.iterrows():
+                for field_name in ["표시번호", "접수", "소재지번", "지목", "면적", "등기원인 및 기타사항"]:
+                    v = str(row.get(field_name, "") or "").strip()
+                    if not v:
+                        continue
+                    fid = f"{pid}#fact-{hashlib.sha1((field_name+'|'+v).encode('utf-8')).hexdigest()[:10]}"
+                    graph.append({"@id": fid, "@type": "Fact", "field": field_name, "value": v})
+                    parcel_node["hasFact"].append(fid)
 
-        def add_fact(field: str, value: Any, *, value_number: Optional[float] = None, unit: Optional[str] = None):
-            if value is None:
-                return
-            v = str(value).strip()
-            if not v:
-                return
-            fid = f"{pid}#fact-{hashlib.sha1((field+'|'+v).encode('utf-8')).hexdigest()[:10]}"
-            fact = {
-                "@id": fid,
-                "@type": "Fact",
-                "field": field,
-                "value": v,
-            }
-            if value_number is not None:
-                fact["valueNumber"] = value_number
-            if unit:
-                fact["unit"] = unit
-            if page is not None and str(page).isdigit():
-                fact["evidencePage"] = int(page)
-            if table_id:
-                fact["evidenceTable"] = str(table_id)
-
-            graph.append(fact)
-            parcel_node["hasFact"].append(fid)
-
-        add_fact("표시번호", row.get("표시번호"))
-        add_fact("접수", row.get("접수"))
-        add_fact("소재지번", row.get("소재지번"))
-        add_fact("지목", row.get("지목"))
-        # 면적 숫자는 면적 문자열에서 다시 파싱
-        area_num = parse_area_to_number(str(row.get("면적", "") or ""))
-        add_fact("면적", row.get("면적"), value_number=area_num, unit="㎡")
-        add_fact("등기원인 및 기타사항", row.get("등기원인 및 기타사항"))
+        # 갑구 Entries
+        if isinstance(g.gab_df, pd.DataFrame) and not g.gab_df.empty:
+            for _, row in g.gab_df.iterrows():
+                rank = str(row.get("순위번호", "") or "").strip()
+                purpose = str(row.get("등기목적", "") or "").strip()
+                acc = str(row.get("접수", "") or "").strip()
+                cause = str(row.get("등기원인", "") or "").strip()
+                holder = str(row.get("권리자 및 기타사항", "") or "").strip()
+                if not (rank or purpose or acc or cause or holder):
+                    continue
+                eid = f"{pid}#gab-{hashlib.sha1((rank+'|'+purpose+'|'+acc).encode('utf-8')).hexdigest()[:12]}"
+                graph.append(
+                    {
+                        "@id": eid,
+                        "@type": "GabEntry",
+                        "rankNo": rank,
+                        "purpose": purpose,
+                        "acceptance": acc,
+                        "cause": cause,
+                        "holderNote": holder,
+                    }
+                )
+                parcel_node["hasGabEntry"].append(eid)
 
     return {"@context": context, "@graph": graph}
 
@@ -868,7 +1113,7 @@ def make_jsonld_bytes(obj: Dict[str, Any]) -> bytes:
 
 
 # ============================================================
-# 7) 전체 처리
+# 10) 전체 처리
 # ============================================================
 def process_pdf(
     file_bytes: bytes,
@@ -878,17 +1123,18 @@ def process_pdf(
     pages_per_request: int,
     lang: str,
     progress_cb: Optional[Callable[[int, int, int, int], None]] = None,
-) -> Tuple[List[ParsedTable], pd.DataFrame, List[ParsedTable]]:
+) -> Tuple[List[ParcelGroup], int]:
     """
     반환:
-      - all_tables: OCR에서 나온 전체 tables
-      - pyo_df: 표제부 정리 DataFrame(합친 결과)
-      - pyo_tables: 표제부 후보로 판정된 tables
+      - groups: 지번별 ParcelGroup 리스트(표제부+갑구)
+      - total_pages
     """
     pages_per_request = max(1, min(int(pages_per_request), MAX_PAGES_PER_REQUEST))
+    total_pages = get_pdf_total_pages(file_bytes)
     chunks = split_pdf_into_chunks(file_bytes, pages_per_request)
 
     all_tables: List[ParsedTable] = []
+    all_page_lines: Dict[int, List[PageLine]] = {}
 
     for i, (chunk_pdf, start_p, end_p) in enumerate(chunks, start=1):
         if progress_cb:
@@ -905,45 +1151,111 @@ def process_pdf(
             raise RuntimeError(f"OCR JSON 파싱 실패 (pages {start_p}-{end_p})\n{res.get('text')}")
 
         page_numbers = list(range(start_p, end_p + 1))
-        tables = parse_tables_from_ocr_json(ocr_json, page_numbers=page_numbers)
+        tables, page_lines = parse_tables_and_lines_from_ocr_json(ocr_json, page_numbers=page_numbers)
         all_tables.extend(tables)
+        all_page_lines.update(page_lines)
 
     if progress_cb:
         progress_cb(len(chunks), len(chunks), 0, 0)
 
-    # 표제부 후보 테이블 찾기
+    # --------------------
+    # 표제부 추출
+    # --------------------
     pyo_candidates = find_pyo_tables(all_tables)
-
-    # 표제부 정리 DF 만들기
-    pyo_dfs = []
-    pyo_tables = []
+    pyo_items: List[Tuple[ParsedTable, pd.DataFrame]] = []
     for (t, header_row, col_map) in pyo_candidates:
         df = extract_pyo_records_from_table(t, header_row, col_map)
         if not df.empty:
-            pyo_dfs.append(df)
-            pyo_tables.append(t)
+            pyo_items.append((t, df))
 
-    pyo_df = pd.concat(pyo_dfs, ignore_index=True) if pyo_dfs else pd.DataFrame()
+    groups = group_parcels_from_pyo(pyo_items, total_pages=total_pages)
 
-    return all_tables, pyo_df, pyo_tables
+    # 표제부가 하나도 없으면 UNKNOWN 그룹 하나 생성
+    if not groups:
+        groups = [ParcelGroup(key="UNKNOWN", start_page=1, end_page=total_pages)]
+
+    # 그룹에 표제부 테이블/DF 할당
+    # (group_parcels_from_pyo가 이미 할당했지만, UNKNOWN 케이스 대비)
+    if groups and pyo_items:
+        by_key = {g.key: g for g in groups}
+        for t, df in pyo_items:
+            key = _pick_group_key_from_pyo_df(df, fallback=t.table_id)
+            g = by_key.get(key)
+            if g is None:
+                # 새 그룹 생성(예외)
+                g = ParcelGroup(key=key, start_page=t.page_no, end_page=total_pages)
+                groups.append(g)
+                by_key[key] = g
+            g.pyo_tables.append(t)
+            g.pyo_df = pd.concat([g.pyo_df, df], ignore_index=True) if isinstance(g.pyo_df, pd.DataFrame) and not g.pyo_df.empty else df
+
+    # --------------------
+    # 갑구 추출
+    # --------------------
+    gab_candidates = find_gab_tables(all_tables)
+
+    gab_df_by_group: Dict[str, List[pd.DataFrame]] = {g.key: [] for g in groups}
+
+    for (t, header_row, col_map) in gab_candidates:
+        # 페이지 텍스트로 갑/을 구 구분
+        section = classify_gab_or_eul(t, all_page_lines.get(t.page_no, []))
+        if section != "갑구":
+            continue  # ✅ 지금은 갑구만
+
+        df = extract_gab_records_from_table(t, header_row, col_map)
+        if df.empty:
+            continue
+
+        g = assign_table_to_group(groups, t.page_no)
+        if g is None:
+            # UNKNOWN에 넣기
+            g = next((x for x in groups if x.key == "UNKNOWN"), None)
+            if g is None:
+                g = ParcelGroup(key="UNKNOWN", start_page=1, end_page=total_pages)
+                groups.append(g)
+
+        g.gab_tables.append(t)
+        gab_df_by_group.setdefault(g.key, []).append(df)
+
+    # 그룹별 gab_df finalize
+    for g in groups:
+        dfs = gab_df_by_group.get(g.key) or []
+        if dfs:
+            gab_df = pd.concat(dfs, ignore_index=True).drop_duplicates()
+            # 컬럼 정리
+            cols = ["페이지", "table_id", "순위번호", "등기목적", "접수", "등기원인", "권리자 및 기타사항"]
+            g.gab_df = gab_df[[c for c in cols if c in gab_df.columns]]
+        else:
+            g.gab_df = pd.DataFrame(columns=["순위번호", "등기목적", "접수", "등기원인", "권리자 및 기타사항"])
+
+    # 표제부 DF 중복 제거
+    for g in groups:
+        if isinstance(g.pyo_df, pd.DataFrame) and not g.pyo_df.empty:
+            g.pyo_df = g.pyo_df.drop_duplicates()
+
+    # 그룹 정렬(시작 페이지)
+    groups.sort(key=lambda x: x.start_page)
+
+    return groups, total_pages
 
 
 # ============================================================
-# 8) Streamlit UI
+# 11) Streamlit UI
 # ============================================================
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="📄", layout="wide")
     st.title(APP_TITLE)
-    st.caption(f"{APP_VERSION} | Naver Table OCR → 표제부 정리 엑셀")
+    st.caption(f"{APP_VERSION} | Naver Table OCR(enableTableDetection) → 표제부/갑구 정리")
 
     st.markdown(
         """
-### 이 앱이 하는 일
-- **네이버 표추출 OCR(enableTableDetection)** 로 PDF 전체를 인식한 뒤  
-- **토지 등기 '표제부' 테이블만** 자동으로 찾아서  
-- **보기 좋은 형태(정리된 표)** 로 재가공한 엑셀을 만들어줍니다.
+### 기능
+- 네이버 **표추출 OCR(enableTableDetection)** 로 PDF 전체를 인식
+- **표제부**: 표시번호/접수/소재지번/지목/면적/등기원인 및 기타사항 정리
+- **갑구**: 순위번호/등기목적/접수/등기원인/권리자 및 기타사항 정리
+- 표제부/갑구가 여러 지번으로 존재하면 **지번별로 표를 분리**해서 보여주고 엑셀 시트도 분리
 
-> 표 추출은 도메인 설정에서 **‘표 추출 여부’가 ON**이어야 합니다.
+> 표 추출은 네이버 콘솔 Domain에서 **‘표 추출 여부’가 ON**이어야 합니다.
 """
     )
 
@@ -972,12 +1284,13 @@ def main():
 
         st.divider()
         st.header("📦 출력 옵션")
-        include_raw_tables = st.checkbox("표제부 원본 테이블 시트(raw_...)도 포함", value=True)
-        merge_cells = st.checkbox("raw 시트에서 병합셀 반영", value=True)
+        include_raw_pyo = st.checkbox("표제부 raw 테이블 시트 포함", value=False)
+        include_raw_gab = st.checkbox("갑구 raw 테이블 시트 포함", value=False)
+        merge_cells_on_raw = st.checkbox("raw 시트에서 병합셀 반영", value=True)
 
         st.divider()
         st.header("🧠 온톨로지(JSON-LD)")
-        export_jsonld = st.checkbox("표제부 JSON-LD도 생성", value=True)
+        export_jsonld = st.checkbox("표제부+갑구 JSON-LD 생성", value=False)
 
     uploaded_file = st.file_uploader("📎 PDF 업로드", type=["pdf"])
     if uploaded_file is None:
@@ -987,13 +1300,12 @@ def main():
     file_bytes = uploaded_file.getvalue()
     file_hash = hashlib.sha256(file_bytes).hexdigest()
 
-    # 파일이 바뀌면 초기화
     if st.session_state.get("file_hash") != file_hash:
-        for k in ["pyo_df", "pyo_excel", "pyo_tables", "jsonld_obj", "jsonld_bytes"]:
+        for k in ["groups", "excel_bytes", "jsonld_obj", "jsonld_bytes", "total_pages"]:
             st.session_state.pop(k, None)
         st.session_state["file_hash"] = file_hash
 
-    clicked = st.button("🚀 표제부 추출 시작", disabled=not bool(api_url and secret_key))
+    clicked = st.button("🚀 표제부+갑구 추출 시작", disabled=not bool(api_url and secret_key))
     if clicked:
         if not api_url or not secret_key:
             st.error("API URL/SECRET을 입력하세요.")
@@ -1010,8 +1322,8 @@ def main():
             else:
                 status.write("📄 마무리 중...")
 
-        with st.spinner("OCR 및 표제부 정리 중..."):
-            all_tables, pyo_df, pyo_tables = process_pdf(
+        with st.spinner("OCR 및 표제부/갑구 정리 중..."):
+            groups, total_pages = process_pdf(
                 file_bytes,
                 api_url,
                 secret_key,
@@ -1020,81 +1332,101 @@ def main():
                 progress_cb=progress_cb,
             )
 
-            pyo_excel = build_pyo_excel_bytes(
-                pyo_df=pyo_df,
-                pyo_tables=pyo_tables,
-                merge_cells=merge_cells,
-                include_raw_tables=include_raw_tables,
+            excel_bytes = build_registry_excel_bytes(
+                groups=groups,
+                include_raw_pyo=include_raw_pyo,
+                include_raw_gab=include_raw_gab,
+                merge_cells_on_raw=merge_cells_on_raw,
             )
 
             jsonld_obj = None
             jsonld_bytes = b""
             if export_jsonld:
-                jsonld_obj = build_pyo_jsonld(
+                jsonld_obj = build_registry_jsonld(
                     file_name=uploaded_file.name,
                     file_hash=file_hash,
-                    pyo_df=pyo_df,
+                    groups=groups,
                 )
                 jsonld_bytes = make_jsonld_bytes(jsonld_obj)
 
-        st.session_state["pyo_df"] = pyo_df
-        st.session_state["pyo_excel"] = pyo_excel
-        st.session_state["pyo_tables"] = pyo_tables
+        st.session_state["groups"] = groups
+        st.session_state["excel_bytes"] = excel_bytes
         st.session_state["jsonld_obj"] = jsonld_obj
         st.session_state["jsonld_bytes"] = jsonld_bytes
+        st.session_state["total_pages"] = total_pages
 
         progress.progress(100)
         status.write("✅ 완료")
 
     # 결과 표시
-    if st.session_state.get("pyo_df") is not None:
-        pyo_df_obj = st.session_state.get("pyo_df")
-        # pandas.DataFrame는 bool 컨텍스트(or/and)에서 ValueError가 발생하므로 명시적으로 처리
-        pyo_df: pd.DataFrame = pyo_df_obj if isinstance(pyo_df_obj, pd.DataFrame) else pd.DataFrame()
-        pyo_excel: bytes = st.session_state.get("pyo_excel", b"")
-        pyo_tables: List[ParsedTable] = st.session_state.get("pyo_tables") or []
-        jsonld_bytes: bytes = st.session_state.get("jsonld_bytes", b"")
-
-        st.divider()
-        st.subheader("✅ 표제부 정리 결과")
-
-        col1, col2 = st.columns([1, 1])
-
-        with col1:
-            st.write(f"- 표제부 후보 테이블 수: **{len(pyo_tables)}**")
-            st.write(f"- 정리 레코드 수(표제부 행): **{len(pyo_df)}**")
-
-            if pyo_excel:
-                st.download_button(
-                    "📥 표제부 전용 엑셀 다운로드",
-                    data=pyo_excel,
-                    file_name=f"{uploaded_file.name}_표제부.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="download_pyo_excel",
-                )
-
-            if export_jsonld and jsonld_bytes:
-                st.download_button(
-                    "🧠 표제부 JSON-LD 다운로드",
-                    data=jsonld_bytes,
-                    file_name=f"{uploaded_file.name}_표제부.jsonld",
-                    mime="application/ld+json",
-                    key="download_pyo_jsonld",
-                )
-
-        with col2:
-            if pyo_df.empty:
-                st.warning("표제부 테이블을 찾지 못했어요. (표제부 헤더 인식 실패 가능)")
-                st.caption("팁: 원본 PDF가 너무 기울어져 있거나 표선이 약하면 표추출이 실패할 수 있어요.")
-            else:
-                st.dataframe(pyo_df, use_container_width=True, hide_index=True)
-
-            if export_jsonld:
-                with st.expander("🧠 JSON-LD 미리보기", expanded=False):
-                    st.json(st.session_state.get("jsonld_obj", {}))
-
-    else:
+    groups_obj = st.session_state.get("groups")
+    if groups_obj is None:
         st.info("추출을 실행하면 결과가 여기에 표시됩니다.")
+        return
+
+    groups: List[ParcelGroup] = groups_obj
+    excel_bytes: bytes = st.session_state.get("excel_bytes", b"")
+    jsonld_bytes: bytes = st.session_state.get("jsonld_bytes", b"")
+
+    st.divider()
+    st.subheader(f"✅ 추출 결과 (지번 그룹 수: {len(groups)})")
+
+    # 다운로드
+    if excel_bytes:
+        st.download_button(
+            "📥 엑셀 다운로드 (지번별 시트: 표제부/갑구)",
+            data=excel_bytes,
+            file_name=f"{uploaded_file.name}_등기정리.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_excel",
+        )
+
+    if export_jsonld and jsonld_bytes:
+        st.download_button(
+            "🧠 JSON-LD 다운로드",
+            data=jsonld_bytes,
+            file_name=f"{uploaded_file.name}_등기정리.jsonld",
+            mime="application/ld+json",
+            key="download_jsonld",
+        )
+
+    # 그룹별 표시 (탭/익스팬더)
+    group_labels = [f"{g.key} (p{g.start_page}-{g.end_page})" for g in groups]
+
+    if len(groups) <= 8:
+        tabs = st.tabs(group_labels)
+        for tab, g in zip(tabs, groups):
+            with tab:
+                _render_group(g)
+    else:
+        for g in groups:
+            with st.expander(f"📌 {g.key} (p{g.start_page}-{g.end_page})", expanded=False):
+                _render_group(g)
+
+    if export_jsonld:
+        with st.expander("🧠 JSON-LD 미리보기", expanded=False):
+            st.json(st.session_state.get("jsonld_obj", {}))
+
+
+def _render_group(g: ParcelGroup):
+    # 표제부
+    st.markdown("#### 표제부")
+    pyo_df = g.pyo_df if isinstance(g.pyo_df, pd.DataFrame) else pd.DataFrame()
+    pyo_cols = ["표시번호", "접수", "소재지번", "지목", "면적", "등기원인 및 기타사항"]
+    if pyo_df.empty:
+        st.info("표제부 없음")
+    else:
+        st.dataframe(pyo_df[[c for c in pyo_cols if c in pyo_df.columns]], use_container_width=True, hide_index=True)
+
+    # 갑구
+    st.markdown("#### 갑구")
+    gab_df = g.gab_df if isinstance(g.gab_df, pd.DataFrame) else pd.DataFrame()
+    gab_cols = ["순위번호", "등기목적", "접수", "등기원인", "권리자 및 기타사항"]
+    if gab_df.empty:
+        st.info("갑구 없음(또는 갑구 표 검출 실패)")
+        st.caption("팁: '갑 구' 라벨이 표 위쪽에 OCR로 잡히지 않으면 갑구로 분류가 안될 수 있어요.")
+    else:
+        st.dataframe(gab_df[[c for c in gab_cols if c in gab_df.columns]], use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
