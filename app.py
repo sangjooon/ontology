@@ -56,7 +56,7 @@ from openpyxl.utils import get_column_letter
 # 0) 앱 설정
 # ============================================================
 APP_TITLE = "문서 비서📄 dev — 토지 등기 표제부 전용"
-APP_VERSION = "v0.5.1"
+APP_VERSION = "v0.5.2"
 
 DEFAULT_PASSWORD = "alohomora"  # 데모용
 MAX_PAGES_PER_REQUEST = 10      # Naver General OCR PDF 최대 10페이지/요청
@@ -271,6 +271,11 @@ PYO_ONTOLOGY: Dict[str, Dict[str, Any]] = {
         "aliases": ["표시번호", "표시 번호", "표시no", "표시No", "표시"],
         "dtype": "string",
     },
+    "acceptance": {
+        "label": "접수",
+        "aliases": ["접수", "접 수", "접수일자", "접수번호"],
+        "dtype": "string",
+    },
     "lot_address": {
         "label": "소재지번",
         "aliases": ["소재지번", "소재 지번", "소재지", "소 재 지 번", "소재지번(토지)", "소재지번(대지)"],
@@ -410,6 +415,11 @@ def find_pyo_tables(tables: List[ParsedTable]) -> List[Tuple[ParsedTable, int, D
                 col_map["display_no"] = c
                 continue
 
+            # 접수
+            if "acceptance" not in col_map and _contains_any(cell_norm, PYO_ONTOLOGY["acceptance"]["aliases"]):
+                col_map["acceptance"] = c
+                continue
+
             # 소재지번
             if "lot_address" not in col_map and _contains_any(cell_norm, PYO_ONTOLOGY["lot_address"]["aliases"]):
                 col_map["lot_address"] = c
@@ -437,6 +447,15 @@ def find_pyo_tables(tables: List[ParsedTable]) -> List[Tuple[ParsedTable, int, D
             # 소재지번은 지목 앞쪽에 있을 확률이 큼
             col_map["lot_address"] = max(0, min(col_map["land_category"] - 1, t.n_cols - 1))
 
+
+        # 접수 컬럼이 없으면 (표시번호 다음)으로 보수적 추정
+        if "acceptance" not in col_map:
+            # 표시번호 다음 칸이 소재지번보다 왼쪽에 있으면 접수로 간주
+            cand = col_map.get("display_no", 0) + 1
+            if cand < col_map.get("lot_address", cand + 1):
+                if cand < t.n_cols:
+                    col_map["acceptance"] = cand
+
         # sanity: 순서 강제(오탐 방지)
         if not (col_map["display_no"] < col_map["land_category"] < col_map["area"]):
             # 구조가 다르면 표제부 아닐 가능성
@@ -458,6 +477,7 @@ def extract_pyo_records_from_table(
       - 페이지, table_id, 표시번호, 소재지번, 지번, 지목, 면적, 면적_숫자
     """
     c_disp = col_map["display_no"]
+    c_acc = col_map.get("acceptance")
     c_addr = col_map["lot_address"]
     c_cat = col_map["land_category"]
     c_area = col_map["area"]
@@ -475,6 +495,22 @@ def extract_pyo_records_from_table(
         # 헤더/잡음 행 skip
         if disp and _contains_any(_norm(disp), ["표제부", "갑구", "을구", "순위번호"]):
             continue
+
+        # 접수: 접수 col ~ 소재지번 직전까지 합치기(접수가 여러 칸으로 쪼개지는 경우 대비)
+        acc_text = ""
+        if c_acc is not None and 0 <= c_acc < t.n_cols:
+            end_c = c_addr
+            if c_acc < end_c:
+                acc_parts = []
+                for c in range(c_acc, end_c):
+                    if c < 0 or c >= t.n_cols:
+                        continue
+                    v = (row[c] or "").strip()
+                    if v:
+                        acc_parts.append(v)
+                acc_text = "\n".join(acc_parts).strip()
+            else:
+                acc_text = (row[c_acc] or "").strip()
 
         # 소재지번: 소재지번 col ~ 지목 직전까지 합치기
         addr_parts = []
@@ -502,18 +538,31 @@ def extract_pyo_records_from_table(
             v = (row[c] or "").strip()
             if v:
                 area_parts.append(v)
-        area_text = " ".join(area_parts).strip()
+        area_text_raw = " ".join(area_parts).strip()
+
+        # 면적 / 등기원인 및 기타사항 분리
+        area_only, note_text = split_area_and_note(area_text_raw)
 
         # continuation row 판단: 표시번호가 없고, 어떤 값이 있으면 이전 행에 이어붙이기
-        is_continuation = (not disp) and (lot_addr or land_cat_raw or area_text)
+        is_continuation = (not disp) and (acc_text or lot_addr or land_cat_raw or area_only or note_text)
 
         if is_continuation and cur is not None:
             if lot_addr:
                 cur["소재지번"] = (cur["소재지번"] + "\n" + lot_addr).strip() if cur["소재지번"] else lot_addr
             if land_cat_raw:
                 cur["지목_raw"] = (cur["지목_raw"] + " " + land_cat_raw).strip() if cur["지목_raw"] else land_cat_raw
-            if area_text:
-                cur["면적"] = (cur["면적"] + " " + area_text).strip() if cur["면적"] else area_text
+            if area_only:
+                # 면적이 비어있으면 채우고, 이미 있으면 보수적으로 유지
+                if not cur.get("면적"):
+                    cur["면적"] = area_only
+            if note_text:
+                cur["등기원인 및 기타사항"] = (
+                    (cur.get("등기원인 및 기타사항") or "").strip() + "\n" + note_text
+                ).strip() if (cur.get("등기원인 및 기타사항") or "").strip() else note_text
+            if acc_text:
+                cur["접수"] = (
+                    (cur.get("접수") or "").strip() + "\n" + acc_text
+                ).strip() if (cur.get("접수") or "").strip() else acc_text
             continue
 
         # 새 레코드 시작 조건: 표시번호가 숫자로 시작하거나(1,2,3) / 5-1 같은 패턴
@@ -522,9 +571,11 @@ def extract_pyo_records_from_table(
                 "페이지": t.page_no,
                 "table_id": t.table_id,
                 "표시번호": disp,
+                "접수": acc_text,
                 "소재지번": lot_addr,
                 "지목_raw": land_cat_raw,
-                "면적": area_text,
+                "면적": area_only,
+                "등기원인 및 기타사항": note_text,
             }
             records.append(cur)
         else:
@@ -542,11 +593,11 @@ def extract_pyo_records_from_table(
     # 지목 정규화
     df["지목"] = df["지목_raw"].apply(normalize_land_category)
 
-    # 면적 숫자(㎡)
-    df["면적_숫자"] = df["면적"].apply(parse_area_to_number)
+    # 면적 숫자(㎡)는 내부 계산용(필요하면)
+    # df["_면적_숫자"] = df["면적"].apply(parse_area_to_number)
 
     # 보기 좋게 컬럼 순서
-    cols = ["페이지", "table_id", "표시번호", "소재지번", "지번", "지목", "면적", "면적_숫자"]
+    cols = ["페이지", "table_id", "표시번호", "접수", "소재지번", "지번", "지목", "면적", "등기원인 및 기타사항"]
     df = df[[c for c in cols if c in df.columns]]
 
     return df
@@ -771,9 +822,13 @@ def build_pyo_jsonld(
             parcel_node["hasFact"].append(fid)
 
         add_fact("표시번호", row.get("표시번호"))
+        add_fact("접수", row.get("접수"))
         add_fact("소재지번", row.get("소재지번"))
         add_fact("지목", row.get("지목"))
-        add_fact("면적", row.get("면적"), value_number=row.get("면적_숫자"), unit="㎡")
+        # 면적 숫자는 면적 문자열에서 다시 파싱
+        area_num = parse_area_to_number(str(row.get("면적", "") or ""))
+        add_fact("면적", row.get("면적"), value_number=area_num, unit="㎡")
+        add_fact("등기원인 및 기타사항", row.get("등기원인 및 기타사항"))
 
     return {"@context": context, "@graph": graph}
 
