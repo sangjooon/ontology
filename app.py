@@ -1,19 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-문서 비서 📄  (Naver CLOVA OCR: Table Detection -> Excel)
--------------------------------------------------------
-요구사항:
-- 네이버 CLOVA OCR "General OCR + enableTableDetection=true" 사용
-- PDF의 모든 페이지를 OCR 처리
-- OCR 응답의 images[].tables[].cells 정보를 이용해 표를 '그대로' 엑셀로 저장
-  - rowIndex/columnIndex 기반으로 셀 배치
-  - rowSpan/columnSpan을 Excel 병합(merge cells)로 반영(옵션)
+문서 비서 📄  (Naver Table OCR → "토지 등기 표제부"만 정리해서 엑셀로)
+============================================================
+
+요구사항(사용자 요청):
+- 네이버 CLOVA OCR General + enableTableDetection=true (표추출 OCR) 사용
+- PDF 전체를 OCR 처리한 뒤,
+  "등기사항전부증명서(토지) - 표제부" 테이블만 골라서 보기 좋게 재가공
+- 결과를 "표제부 전용 엑셀"로 따로 다운로드
+- (선택) JSON-LD(간단 온톨로지 그래프)도 함께 다운로드
+
+핵심 아이디어:
+1) Naver가 내려주는 tables/cells(rowIndex, columnIndex, rowSpan, columnSpan)를 그대로 활용한다.
+2) 표제부 후보 테이블은 '헤더 라인'에서
+   [표시번호, 소재지번, 지목, 면적] 컬럼이 함께 나타나는 테이블을 우선으로 잡는다.
+3) 소재지번이 여러 칸으로 쪼개지는 경우가 많아서,
+   "소재지번 col ~ 지목 col 직전"까지를 합쳐서 소재지번으로 만든다.
+   면적도 "면적 col ~ 끝"까지 합친다.
+4) 표시번호가 비어있는 줄은 '이어쓰기(continuation)'로 판단해 이전 행에 병합한다.
 
 주의:
-- 표 추출은 "도메인 설정에서 '표 추출 여부'를 ON" 해야 동작합니다.
-  (OFF인 상태에서 enableTableDetection=true로 호출하면 에러가 납니다.)
+- 표 추출은 도메인 설정에서 "표 추출 여부"가 ON이어야 동작합니다.
+- OCR 결과가 표를 잘못 나누면, 완벽 복원은 불가능합니다.
+  그래도 표제부는 구조가 비교적 단순해서 성공률이 높은 편입니다.
 
-requirements.txt (추천)
+requirements.txt (권장)
 ----------------------
 streamlit
 requests
@@ -34,28 +45,27 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import requests
 import pandas as pd
+import requests
 import streamlit as st
 from openpyxl import Workbook
 from openpyxl.styles import Alignment
 from openpyxl.utils import get_column_letter
 
-
 # ============================================================
 # 0) 앱 설정
 # ============================================================
-APP_TITLE = "문서 비서📄 dev — 네이버 표추출 OCR → 엑셀"
-APP_VERSION = "v0.4.0"
+APP_TITLE = "문서 비서📄 dev — 토지 등기 표제부 전용"
+APP_VERSION = "v0.5.0"
 
 DEFAULT_PASSWORD = "alohomora"  # 데모용
+MAX_PAGES_PER_REQUEST = 10      # Naver General OCR PDF 최대 10페이지/요청
 
-# Naver General OCR: PDF는 API 호출당 최대 10페이지 지원(공식 문서)
-MAX_PAGES_PER_REQUEST = 10
+MAX_SHEETNAME_LEN = 31
 
 
 # ============================================================
-# 1) PDF 유틸 (pypdf/PyPDF2)
+# 1) PDF 유틸
 # ============================================================
 def _import_pypdf():
     try:
@@ -67,15 +77,11 @@ def _import_pypdf():
 
 
 def split_pdf_into_chunks(pdf_bytes: bytes, chunk_size: int) -> List[Tuple[bytes, int, int]]:
-    """
-    PDF bytes를 chunk_size 페이지 단위로 쪼개서
-    [(chunk_pdf_bytes, start_page(1-indexed), end_page(1-indexed)), ...] 반환
-    """
     PdfReader, PdfWriter = _import_pypdf()
     reader = PdfReader(io.BytesIO(pdf_bytes))
     total = len(reader.pages)
-    out: List[Tuple[bytes, int, int]] = []
 
+    out: List[Tuple[bytes, int, int]] = []
     for start in range(0, total, chunk_size):
         end = min(start + chunk_size, total)
         w = PdfWriter()
@@ -88,7 +94,7 @@ def split_pdf_into_chunks(pdf_bytes: bytes, chunk_size: int) -> List[Tuple[bytes
 
 
 # ============================================================
-# 2) 네이버 OCR 호출 (enableTableDetection=True)
+# 2) 네이버 OCR 호출 (표추출 ON)
 # ============================================================
 def call_naver_ocr_table(
     file_bytes: bytes,
@@ -98,22 +104,17 @@ def call_naver_ocr_table(
     lang: str = "ko",
     timeout: int = 180,
 ) -> Dict[str, Any]:
-    """
-    네이버 CLOVA OCR General 호출 (multipart/form-data) + 표 추출 활성화.
-    - api_url: 도메인 Invoke URL의 /general 엔드포인트
-    """
     request_json = {
         "images": [{"format": "pdf", "name": "upload"}],
         "requestId": str(uuid.uuid4()),
         "version": "V2",
         "timestamp": int(round(time.time() * 1000)),
         "lang": lang,
-        "enableTableDetection": True,  # ✅ 표 추출
+        "enableTableDetection": True,
     }
 
     payload = {"message": json.dumps(request_json, ensure_ascii=False)}
     headers = {"X-OCR-SECRET": secret_key}
-
     files = {"file": ("upload.pdf", file_bytes, "application/pdf")}
 
     try:
@@ -153,7 +154,7 @@ class ParsedTable:
     bbox: Optional[Tuple[float, float, float, float]]
     n_rows: int
     n_cols: int
-    grid: List[List[str]]  # [r][c]
+    grid: List[List[str]]               # [r][c] (top-left only if merged)
     merges: List[Tuple[int, int, int, int]]  # (r0,c0,r1,c1) 0-based inclusive
     cells: List[ParsedCell]
 
@@ -170,38 +171,27 @@ def _bbox_from_vertices(vertices: List[Dict[str, Any]]) -> Optional[Tuple[float,
 
 
 def _cell_text(cell: Dict[str, Any]) -> str:
-    """
-    cellTextLines -> cellWords -> inferText 를 join해서 셀 텍스트 복원
-    """
     lines = cell.get("cellTextLines") or []
     out_lines: List[str] = []
     for ln in lines:
         words = ln.get("cellWords") or []
-        wtxt = " ".join((w.get("inferText") or "").strip() for w in words if (w.get("inferText") or "").strip())
+        wtxt = " ".join(
+            (w.get("inferText") or "").strip()
+            for w in words
+            if (w.get("inferText") or "").strip()
+        )
         wtxt = re.sub(r"\s+", " ", wtxt).strip()
         if wtxt:
             out_lines.append(wtxt)
-    # 줄바꿈 유지
     return "\n".join(out_lines).strip()
 
 
-def parse_tables_from_ocr_json(
-    ocr_json: Dict[str, Any],
-    *,
-    page_numbers: List[int],
-    sheet_prefix: str = "",
-) -> List[ParsedTable]:
-    """
-    Naver OCR 응답(JSON)에서 tables를 파싱해 ParsedTable 리스트 반환.
-    - page_numbers: 호출한 PDF chunk의 원본 페이지 번호 매핑(이미지 인덱스 -> page_no)
-    """
+def parse_tables_from_ocr_json(ocr_json: Dict[str, Any], *, page_numbers: List[int]) -> List[ParsedTable]:
     tables_out: List[ParsedTable] = []
     images = ocr_json.get("images", []) if isinstance(ocr_json, dict) else []
 
     for img_idx, img in enumerate(images):
         page_no = page_numbers[img_idx] if img_idx < len(page_numbers) else (img_idx + 1)
-
-        # 표 추출 결과는 images[].tables 로 제공됨 (enableTableDetection=true)
         tables = img.get("tables") or []
         if not tables:
             continue
@@ -214,10 +204,7 @@ def parse_tables_from_ocr_json(
             max_c = 0
             merges: List[Tuple[int, int, int, int]] = []
 
-            # 테이블 bbox
-            t_bbox = None
-            bp = (t.get("boundingPoly") or {}).get("vertices") or []
-            t_bbox = _bbox_from_vertices(bp)
+            t_bbox = _bbox_from_vertices(((t.get("boundingPoly") or {}).get("vertices")) or [])
 
             for c in cells_raw:
                 r = int(c.get("rowIndex", 0))
@@ -227,9 +214,7 @@ def parse_tables_from_ocr_json(
 
                 txt = _cell_text(c)
 
-                c_bbox = None
-                cbp = (c.get("boundingPoly") or {}).get("vertices") or []
-                c_bbox = _bbox_from_vertices(cbp)
+                c_bbox = _bbox_from_vertices(((c.get("boundingPoly") or {}).get("vertices")) or [])
 
                 conf = c.get("inferConfidence")
                 try:
@@ -250,17 +235,13 @@ def parse_tables_from_ocr_json(
             n_rows = max_r
             n_cols = max_c
 
-            # grid 채우기
             grid = [["" for _ in range(n_cols)] for _ in range(n_rows)]
             for pc in parsed_cells:
-                # top-left에만 값 기입
                 if 0 <= pc.row < n_rows and 0 <= pc.col < n_cols:
                     grid[pc.row][pc.col] = pc.text
 
             table_id = f"p{page_no}_t{t_idx}"
-            sheet_name = f"{sheet_prefix}p{page_no}_t{t_idx}" if sheet_prefix else f"p{page_no}_t{t_idx}"
-            # Excel sheet name 제한 31
-            sheet_name = sheet_name[:31]
+            sheet_name = f"p{page_no}_t{t_idx}"[:MAX_SHEETNAME_LEN]
 
             tables_out.append(
                 ParsedTable(
@@ -281,88 +262,386 @@ def parse_tables_from_ocr_json(
 
 
 # ============================================================
-# 4) Excel 생성 (merge cells 반영)
+# 4) "표제부" 온톨로지(간단) + 추출/정리 로직
+# ============================================================
+# (온톨로지 역할) 표제부에서 의미가 있는 필드(개념)와 라벨(동의어/오독)을 정의
+PYO_ONTOLOGY: Dict[str, Dict[str, Any]] = {
+    "display_no": {
+        "label": "표시번호",
+        "aliases": ["표시번호", "표시 번호", "표시no", "표시No", "표시"],
+        "dtype": "string",
+    },
+    "lot_address": {
+        "label": "소재지번",
+        "aliases": ["소재지번", "소재 지번", "소재지", "소 재 지 번", "소재지번(토지)", "소재지번(대지)"],
+        "dtype": "string",
+    },
+    "land_category": {
+        "label": "지목",
+        "aliases": ["지목", "지 목"],
+        "dtype": "string",
+    },
+    "area": {
+        "label": "면적",
+        "aliases": ["면적", "면 적", "면적(㎡)", "면적(m2)", "면적(m²)", "면 적(㎡)"],
+        "dtype": "number",
+        "unit": "㎡",
+    },
+}
+
+# 지목 통제어휘(간단)
+LAND_CATEGORIES = [
+    "전","답","과수원","목장용지","임야","광천지","염전","대","공장용지","학교용지","주차장","주유소용지",
+    "창고용지","도로","철도용지","제방","하천","구거","유지","양어장","수도용지","공원","체육용지",
+    "유원지","종교용지","사적지","묘지","잡종지"
+]
+LAND_CATEGORY_ALIASES = {
+    "음야": "임야",
+    "임아": "임야",
+    "대지": "대",
+}
+
+
+def _norm(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", "", s)
+    return s.lower()
+
+
+def _contains_any(norm_text: str, aliases: List[str]) -> bool:
+    for a in aliases:
+        if _norm(a) and _norm(a) in norm_text:
+            return True
+    return False
+
+
+def normalize_land_category(raw: str) -> str:
+    s = (raw or "").strip()
+    s2 = re.sub(r"\s+", "", s)
+    if s2 in LAND_CATEGORY_ALIASES:
+        s2 = LAND_CATEGORY_ALIASES[s2]
+    if s2 in LAND_CATEGORIES:
+        return s2
+    # 약한 fuzzy: 글자 1~2개 차이 정도만 보정 (한글 길이가 짧으므로 보수적으로)
+    # ex) '임야' vs '입야' 같은 경우
+    best = ""
+    best_score = 0
+    for cat in LAND_CATEGORIES:
+        # 공통 글자 수 기반
+        score = sum(1 for ch in s2 if ch in cat)
+        if score > best_score:
+            best_score = score
+            best = cat
+    if best_score >= 2 and len(s2) <= 4:
+        return best
+    return s
+
+
+def parse_area_to_number(area_text: str) -> Optional[float]:
+    s = (area_text or "").replace(",", " ")
+    m = re.search(r"(\d+(?:\.\d+)?)", s)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
+
+
+def extract_lot_no(addr: str) -> str:
+    """
+    소재지번 문자열에서 지번(예: 496-10 / 496) 추출(휴리스틱).
+    - 가장 마지막에 나오는 지번 패턴을 사용
+    """
+    s = (addr or "").strip()
+    m = re.findall(r"\d{1,5}-\d{1,5}", s)
+    if m:
+        return m[-1]
+    m2 = re.findall(r"(?:^|\s)(\d{1,5})(?:\s|$)", s)
+    if m2:
+        return m2[-1].strip()
+    return ""
+
+
+def find_pyo_tables(tables: List[ParsedTable]) -> List[Tuple[ParsedTable, int, Dict[str, int]]]:
+    """
+    표제부 후보 테이블 탐색.
+    반환: [(table, header_row_index, col_map), ...]
+      - header_row_index: 헤더로 판단된 행 인덱스
+      - col_map: {'display_no': c, 'lot_address': c, 'land_category': c, 'area': c}
+    """
+    out: List[Tuple[ParsedTable, int, Dict[str, int]]] = []
+
+    for t in tables:
+        # 너무 작은 표는 제외(노이즈)
+        if t.n_rows < 2 or t.n_cols < 3:
+            continue
+
+        # 각 행에서 "헤더" 찾기
+        header_row = -1
+        header_hits: Dict[str, int] = {}
+
+        for r in range(min(t.n_rows, 8)):  # 헤더는 보통 상단에 있음
+            row_texts = [t.grid[r][c] for c in range(t.n_cols)]
+            row_norm = _norm(" ".join(row_texts))
+
+            hits = {}
+            for key, spec in PYO_ONTOLOGY.items():
+                if _contains_any(row_norm, spec["aliases"]):
+                    hits[key] = 1
+
+            # 표제부 헤더 조건: 표시번호 + (소재지번/지목/면적 중 2개 이상)
+            cond = ("display_no" in hits) and (len(hits) >= 3)
+            if cond:
+                header_row = r
+                header_hits = hits
+                break
+
+        if header_row < 0:
+            continue
+
+        # 헤더행에서 컬럼 매핑
+        col_map: Dict[str, int] = {}
+        for c in range(t.n_cols):
+            cell_norm = _norm(t.grid[header_row][c])
+
+            # 표시번호
+            if "display_no" not in col_map and _contains_any(cell_norm, PYO_ONTOLOGY["display_no"]["aliases"]):
+                col_map["display_no"] = c
+                continue
+
+            # 소재지번
+            if "lot_address" not in col_map and _contains_any(cell_norm, PYO_ONTOLOGY["lot_address"]["aliases"]):
+                col_map["lot_address"] = c
+                continue
+
+            # 지목
+            if "land_category" not in col_map and _contains_any(cell_norm, PYO_ONTOLOGY["land_category"]["aliases"]):
+                col_map["land_category"] = c
+                continue
+
+            # 면적
+            if "area" not in col_map and _contains_any(cell_norm, PYO_ONTOLOGY["area"]["aliases"]):
+                col_map["area"] = c
+                continue
+
+        # fallback: 헤더 텍스트가 합쳐져 있으면 순서로 추정
+        # (표제부 표는 대개 표시번호-소재지번-지목-면적 순)
+        if "display_no" not in col_map:
+            col_map["display_no"] = 0
+
+        # 소재지번/지목/면적의 위치가 안 잡히면 제외
+        if "land_category" not in col_map or "area" not in col_map:
+            continue
+        if "lot_address" not in col_map:
+            # 소재지번은 지목 앞쪽에 있을 확률이 큼
+            col_map["lot_address"] = max(0, min(col_map["land_category"] - 1, t.n_cols - 1))
+
+        # sanity: 순서 강제(오탐 방지)
+        if not (col_map["display_no"] < col_map["land_category"] < col_map["area"]):
+            # 구조가 다르면 표제부 아닐 가능성
+            continue
+
+        out.append((t, header_row, col_map))
+
+    return out
+
+
+def extract_pyo_records_from_table(
+    t: ParsedTable,
+    header_row: int,
+    col_map: Dict[str, int],
+) -> pd.DataFrame:
+    """
+    표제부 테이블 하나를 '정리된' 레코드 테이블로 변환.
+    반환 컬럼:
+      - 페이지, table_id, 표시번호, 소재지번, 지번, 지목, 면적, 면적_숫자
+    """
+    c_disp = col_map["display_no"]
+    c_addr = col_map["lot_address"]
+    c_cat = col_map["land_category"]
+    c_area = col_map["area"]
+
+    records: List[Dict[str, Any]] = []
+    cur: Optional[Dict[str, Any]] = None
+
+    for r in range(header_row + 1, t.n_rows):
+        row = t.grid[r]
+        # 완전 빈 행 skip
+        if all((not (row[c] or "").strip()) for c in range(t.n_cols)):
+            continue
+
+        disp = (row[c_disp] or "").strip()
+        # 헤더/잡음 행 skip
+        if disp and _contains_any(_norm(disp), ["표제부", "갑구", "을구", "순위번호"]):
+            continue
+
+        # 소재지번: 소재지번 col ~ 지목 직전까지 합치기
+        addr_parts = []
+        for c in range(c_addr, c_cat):
+            if c < 0 or c >= t.n_cols:
+                continue
+            v = (row[c] or "").strip()
+            if v:
+                addr_parts.append(v)
+        lot_addr = "\n".join(addr_parts).strip()
+
+        # 지목: 지목 col ~ 면적 직전까지 합치기(지목이 쪼개지는 경우 대비)
+        cat_parts = []
+        for c in range(c_cat, c_area):
+            if c < 0 or c >= t.n_cols:
+                continue
+            v = (row[c] or "").strip()
+            if v:
+                cat_parts.append(v)
+        land_cat_raw = " ".join(cat_parts).strip()
+
+        # 면적: 면적 col ~ 끝까지 합치기
+        area_parts = []
+        for c in range(c_area, t.n_cols):
+            v = (row[c] or "").strip()
+            if v:
+                area_parts.append(v)
+        area_text = " ".join(area_parts).strip()
+
+        # continuation row 판단: 표시번호가 없고, 어떤 값이 있으면 이전 행에 이어붙이기
+        is_continuation = (not disp) and (lot_addr or land_cat_raw or area_text)
+
+        if is_continuation and cur is not None:
+            if lot_addr:
+                cur["소재지번"] = (cur["소재지번"] + "\n" + lot_addr).strip() if cur["소재지번"] else lot_addr
+            if land_cat_raw:
+                cur["지목_raw"] = (cur["지목_raw"] + " " + land_cat_raw).strip() if cur["지목_raw"] else land_cat_raw
+            if area_text:
+                cur["면적"] = (cur["면적"] + " " + area_text).strip() if cur["면적"] else area_text
+            continue
+
+        # 새 레코드 시작 조건: 표시번호가 숫자로 시작하거나(1,2,3) / 5-1 같은 패턴
+        if disp:
+            cur = {
+                "페이지": t.page_no,
+                "table_id": t.table_id,
+                "표시번호": disp,
+                "소재지번": lot_addr,
+                "지목_raw": land_cat_raw,
+                "면적": area_text,
+            }
+            records.append(cur)
+        else:
+            # 표시번호가 없는데 continuation도 아니면 일단 skip
+            continue
+
+    df = pd.DataFrame(records)
+
+    if df.empty:
+        return df
+
+    # 지번 추출
+    df["지번"] = df["소재지번"].apply(extract_lot_no)
+
+    # 지목 정규화
+    df["지목"] = df["지목_raw"].apply(normalize_land_category)
+
+    # 면적 숫자(㎡)
+    df["면적_숫자"] = df["면적"].apply(parse_area_to_number)
+
+    # 보기 좋게 컬럼 순서
+    cols = ["페이지", "table_id", "표시번호", "소재지번", "지번", "지목", "면적", "면적_숫자"]
+    df = df[[c for c in cols if c in df.columns]]
+
+    return df
+
+
+# ============================================================
+# 5) 엑셀 생성 (표제부 전용)
 # ============================================================
 def _safe_sheet_name(name: str, used: set) -> str:
-    n = re.sub(r"[\[\]\*:/\\\?]", "_", name)  # Excel 금지문자 대체
-    n = n[:31] if len(n) > 31 else n
+    n = re.sub(r"[\[\]\*:/\\\?]", "_", name)
+    n = n[:MAX_SHEETNAME_LEN]
     if n not in used:
         used.add(n)
         return n
-    # 중복 방지
     i = 2
     while True:
-        cand = f"{n[:28]}_{i}" if len(n) >= 28 else f"{n}_{i}"
-        cand = cand[:31]
+        cand = f"{n[:MAX_SHEETNAME_LEN-2]}_{i}"[:MAX_SHEETNAME_LEN]
         if cand not in used:
             used.add(cand)
             return cand
         i += 1
 
 
-def tables_to_excel_bytes(
-    tables: List[ParsedTable],
+def _autosize(ws, max_col: int, max_row: int):
+    for c in range(1, max_col + 1):
+        letter = get_column_letter(c)
+        max_len = 0
+        for r in range(1, max_row + 1):
+            v = ws.cell(row=r, column=c).value
+            if v is None:
+                continue
+            s = str(v)
+            max_len = max(max_len, max((len(line) for line in s.splitlines()), default=len(s)))
+        ws.column_dimensions[letter].width = min(70, max(10, max_len + 2))
+
+
+def build_pyo_excel_bytes(
     *,
+    pyo_df: pd.DataFrame,
+    pyo_tables: List[ParsedTable],
     merge_cells: bool = True,
-    autosize: bool = True,
+    include_raw_tables: bool = True,
 ) -> bytes:
     wb = Workbook()
-    ws_index = wb.active
-    ws_index.title = "index"
+    ws_summary = wb.active
+    ws_summary.title = "표제부_정리"
 
-    # index header
-    ws_index.append(["sheet_name", "page", "table_idx", "rows", "cols", "bbox(x0,y0,x1,y1)"])
-
-    used = {"index"}
     wrap = Alignment(wrap_text=True, vertical="top")
 
-    # index rows
-    for t in tables:
-        bbox_s = ""
-        if t.bbox:
-            bbox_s = f"{t.bbox[0]:.1f},{t.bbox[1]:.1f},{t.bbox[2]:.1f},{t.bbox[3]:.1f}"
-        ws_index.append([t.sheet_name, t.page_no, t.table_index_on_page, t.n_rows, t.n_cols, bbox_s])
+    # 1) 정리 시트 (DataFrame)
+    if pyo_df.empty:
+        ws_summary.append(["표제부를 찾지 못했습니다."])
+    else:
+        ws_summary.append(list(pyo_df.columns))
+        for _, row in pyo_df.iterrows():
+            ws_summary.append([row.get(c, "") for c in pyo_df.columns])
 
-    # table sheets
-    for t in tables:
-        sname = _safe_sheet_name(t.sheet_name, used)
-        ws = wb.create_sheet(sname)
-
-        # write grid (1-based in Excel)
-        for r in range(t.n_rows):
-            row_vals = t.grid[r]
-            ws.append(row_vals)
-
-        # apply wrap
-        for row in ws.iter_rows(min_row=1, max_row=t.n_rows, min_col=1, max_col=t.n_cols):
+        # wrap
+        for row in ws_summary.iter_rows(min_row=1, max_row=ws_summary.max_row, min_col=1, max_col=ws_summary.max_column):
             for cell in row:
                 cell.alignment = wrap
 
-        # merge cells
-        if merge_cells:
-            for (r0, c0, r1, c1) in t.merges:
-                # openpyxl: 1-based
-                ws.merge_cells(
-                    start_row=r0 + 1,
-                    start_column=c0 + 1,
-                    end_row=r1 + 1,
-                    end_column=c1 + 1,
-                )
+        _autosize(ws_summary, ws_summary.max_column, ws_summary.max_row)
 
-        # autosize columns (rough)
-        if autosize:
-            for c in range(1, t.n_cols + 1):
-                col_letter = get_column_letter(c)
-                max_len = 0
-                for r in range(1, t.n_rows + 1):
-                    v = ws.cell(row=r, column=c).value
-                    if v is None:
-                        continue
-                    s = str(v)
-                    max_len = max(max_len, max((len(line) for line in s.splitlines()), default=len(s)))
-                # 폭 제한
-                width = min(60, max(10, max_len + 2))
-                ws.column_dimensions[col_letter].width = width
+    # 2) index 시트
+    ws_index = wb.create_sheet("index")
+    ws_index.append(["sheet_name", "page", "table_id", "rows", "cols", "bbox(x0,y0,x1,y1)"])
+    used = {"표제부_정리", "index"}
+
+    # 3) raw table sheets (선택)
+    if include_raw_tables:
+        for t in pyo_tables:
+            bbox_s = ""
+            if t.bbox:
+                bbox_s = f"{t.bbox[0]:.1f},{t.bbox[1]:.1f},{t.bbox[2]:.1f},{t.bbox[3]:.1f}"
+            sheet_name = _safe_sheet_name(f"raw_{t.table_id}", used)
+            ws_index.append([sheet_name, t.page_no, t.table_id, t.n_rows, t.n_cols, bbox_s])
+
+            ws = wb.create_sheet(sheet_name)
+
+            # write grid
+            for r in range(t.n_rows):
+                ws.append(t.grid[r])
+
+            # wrap
+            for row in ws.iter_rows(min_row=1, max_row=t.n_rows, min_col=1, max_col=t.n_cols):
+                for cell in row:
+                    cell.alignment = wrap
+
+            # merge cells
+            if merge_cells:
+                for (r0, c0, r1, c1) in t.merges:
+                    ws.merge_cells(start_row=r0 + 1, start_column=c0 + 1, end_row=r1 + 1, end_column=c1 + 1)
+
+            _autosize(ws, t.n_cols, t.n_rows)
 
     # 저장
     buf = io.BytesIO()
@@ -371,21 +650,20 @@ def tables_to_excel_bytes(
 
 
 # ============================================================
-# 5) (선택) JSON-LD(온톨로지) — 표 구조 저장
+# 6) (선택) JSON-LD(온톨로지 그래프) — 표제부만
 # ============================================================
-def build_tables_jsonld(
+def build_pyo_jsonld(
     *,
     file_name: str,
     file_hash: str,
-    tables: List[ParsedTable],
+    pyo_df: pd.DataFrame,
     base_iri: str = "urn:dovi:",
-    generator: str = "DOVI-NaverTable",
-    include_cells: bool = False,
-    include_bboxes: bool = True,
-    config: Optional[Dict[str, Any]] = None,
+    generator: str = "DOVI-PYO",
 ) -> Dict[str, Any]:
     """
-    Document -> Page -> Table -> (Cell) 그래프(JSON-LD) 생성.
+    간단 JSON-LD:
+    Document -> Parcel -> Fact
+    + evidence로 page/table_id를 Fact에 남김
     """
     base = base_iri if base_iri.endswith(("/", "#", ":")) else base_iri + ":"
     doc_id = f"{base}document:{file_hash}"
@@ -399,39 +677,32 @@ def build_tables_jsonld(
         "id": "@id",
         "type": "@type",
         "Document": "dovi:Document",
-        "Page": "dovi:Page",
-        "Table": "dovi:Table",
-        "TableCell": "dovi:TableCell",
+        "Parcel": "dovi:Parcel",
+        "Fact": "dovi:Fact",
+
         "fileName": "schema:name",
         "fileHash": "dovi:fileHash",
         "createdAt": {"@id": "schema:dateCreated", "@type": "xsd:dateTime"},
         "generator": "schema:generator",
 
-        "hasPage": {"@id": "dovi:hasPage", "@type": "@id"},
-        "pageNumber": {"@id": "dovi:pageNumber", "@type": "xsd:integer"},
-        "hasTable": {"@id": "dovi:hasTable", "@type": "@id"},
+        "mentionsParcel": {"@id": "dovi:mentionsParcel", "@type": "@id"},
+        "hasFact": {"@id": "dovi:hasFact", "@type": "@id"},
 
-        "tableId": "dovi:tableId",
-        "sheetName": "dovi:sheetName",
-        "nRows": {"@id": "dovi:nRows", "@type": "xsd:integer"},
-        "nCols": {"@id": "dovi:nCols", "@type": "xsd:integer"},
-        "bbox": "dovi:bbox",
-        "config": "dovi:config",
+        "lot": "dovi:lot",
+        "siteAddress": "dovi:siteAddress",
 
-        "rowIndex": {"@id": "dovi:rowIndex", "@type": "xsd:integer"},
-        "colIndex": {"@id": "dovi:colIndex", "@type": "xsd:integer"},
-        "rowSpan": {"@id": "dovi:rowSpan", "@type": "xsd:integer"},
-        "colSpan": {"@id": "dovi:colSpan", "@type": "xsd:integer"},
-        "text": "dovi:text",
-        "confidence": "dovi:confidence",
-        "belongsToTable": {"@id": "dovi:belongsToTable", "@type": "@id"},
+        "field": "dovi:field",
+        "value": "dovi:value",
+        "valueNumber": {"@id": "dovi:valueNumber", "@type": "xsd:decimal"},
+        "unit": "dovi:unit",
+        "evidencePage": {"@id": "dovi:evidencePage", "@type": "xsd:integer"},
+        "evidenceTable": "dovi:evidenceTable",
     }
 
     def now_iso():
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     graph: List[Dict[str, Any]] = []
-
     doc_node: Dict[str, Any] = {
         "@id": doc_id,
         "@type": "Document",
@@ -439,63 +710,70 @@ def build_tables_jsonld(
         "fileHash": file_hash,
         "createdAt": now_iso(),
         "generator": generator,
-        "hasPage": [],
+        "mentionsParcel": [],
     }
-    if config is not None:
-        doc_node["config"] = config
     graph.append(doc_node)
 
-    # pages
-    pages = sorted({t.page_no for t in tables})
-    page_ids = {}
-    for p in pages:
-        pid = f"{doc_id}#page-{p}"
-        page_ids[p] = pid
-        doc_node["hasPage"].append(pid)
-        graph.append({"@id": pid, "@type": "Page", "pageNumber": p, "hasTable": []})
+    if pyo_df is None or pyo_df.empty:
+        return {"@context": context, "@graph": graph}
 
-    # table nodes + optional cells
-    for t in tables:
-        tid = f"{doc_id}#table-{t.table_id}"
-        # attach to page
-        page_node_id = page_ids.get(t.page_no)
-        if page_node_id:
-            # find page node and append
-            for n in graph:
-                if n.get("@id") == page_node_id:
-                    n.setdefault("hasTable", []).append(tid)
-                    break
+    def pid_for(lot: str, addr: str) -> str:
+        key = (addr or "") + "|" + (lot or "")
+        hid = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+        return f"{doc_id}#parcel-{hid}"
 
-        tnode: Dict[str, Any] = {
-            "@id": tid,
-            "@type": "Table",
-            "tableId": t.table_id,
-            "sheetName": t.sheet_name,
-            "nRows": t.n_rows,
-            "nCols": t.n_cols,
-        }
-        if include_bboxes and t.bbox:
-            tnode["bbox"] = [float(x) for x in t.bbox]
-        graph.append(tnode)
+    for _, row in pyo_df.iterrows():
+        addr = str(row.get("소재지번", "") or "")
+        lot = str(row.get("지번", "") or "")
+        pid = pid_for(lot, addr)
 
-        if include_cells:
-            for pc in t.cells:
-                cid = f"{tid}#cell-{pc.row}-{pc.col}"
-                cnode: Dict[str, Any] = {
-                    "@id": cid,
-                    "@type": "TableCell",
-                    "belongsToTable": tid,
-                    "rowIndex": pc.row,
-                    "colIndex": pc.col,
-                    "rowSpan": pc.row_span,
-                    "colSpan": pc.col_span,
-                    "text": pc.text,
+        if pid not in doc_node["mentionsParcel"]:
+            doc_node["mentionsParcel"].append(pid)
+            graph.append(
+                {
+                    "@id": pid,
+                    "@type": "Parcel",
+                    "lot": lot,
+                    "siteAddress": addr,
+                    "hasFact": [],
                 }
-                if pc.conf is not None:
-                    cnode["confidence"] = pc.conf
-                if include_bboxes and pc.bbox:
-                    cnode["bbox"] = [float(x) for x in pc.bbox]
-                graph.append(cnode)
+            )
+
+        # parcel node ref
+        parcel_node = next(n for n in graph if n.get("@id") == pid)
+
+        page = row.get("페이지")
+        table_id = row.get("table_id")
+
+        def add_fact(field: str, value: Any, *, value_number: Optional[float] = None, unit: Optional[str] = None):
+            if value is None:
+                return
+            v = str(value).strip()
+            if not v:
+                return
+            fid = f"{pid}#fact-{hashlib.sha1((field+'|'+v).encode('utf-8')).hexdigest()[:10]}"
+            fact = {
+                "@id": fid,
+                "@type": "Fact",
+                "field": field,
+                "value": v,
+            }
+            if value_number is not None:
+                fact["valueNumber"] = value_number
+            if unit:
+                fact["unit"] = unit
+            if page is not None and str(page).isdigit():
+                fact["evidencePage"] = int(page)
+            if table_id:
+                fact["evidenceTable"] = str(table_id)
+
+            graph.append(fact)
+            parcel_node["hasFact"].append(fid)
+
+        add_fact("표시번호", row.get("표시번호"))
+        add_fact("소재지번", row.get("소재지번"))
+        add_fact("지목", row.get("지목"))
+        add_fact("면적", row.get("면적"), value_number=row.get("면적_숫자"), unit="㎡")
 
     return {"@context": context, "@graph": graph}
 
@@ -505,9 +783,9 @@ def make_jsonld_bytes(obj: Dict[str, Any]) -> bytes:
 
 
 # ============================================================
-# 6) 전체 처리
+# 7) 전체 처리
 # ============================================================
-def process_pdf_to_tables(
+def process_pdf(
     file_bytes: bytes,
     api_url: str,
     secret_key: str,
@@ -515,11 +793,18 @@ def process_pdf_to_tables(
     pages_per_request: int,
     lang: str,
     progress_cb: Optional[Callable[[int, int, int, int], None]] = None,
-) -> List[ParsedTable]:
+) -> Tuple[List[ParsedTable], pd.DataFrame, List[ParsedTable]]:
+    """
+    반환:
+      - all_tables: OCR에서 나온 전체 tables
+      - pyo_df: 표제부 정리 DataFrame(합친 결과)
+      - pyo_tables: 표제부 후보로 판정된 tables
+    """
     pages_per_request = max(1, min(int(pages_per_request), MAX_PAGES_PER_REQUEST))
     chunks = split_pdf_into_chunks(file_bytes, pages_per_request)
 
     all_tables: List[ParsedTable] = []
+
     for i, (chunk_pdf, start_p, end_p) in enumerate(chunks, start=1):
         if progress_cb:
             progress_cb(i, len(chunks), start_p, end_p)
@@ -535,31 +820,45 @@ def process_pdf_to_tables(
             raise RuntimeError(f"OCR JSON 파싱 실패 (pages {start_p}-{end_p})\n{res.get('text')}")
 
         page_numbers = list(range(start_p, end_p + 1))
-        parsed = parse_tables_from_ocr_json(ocr_json, page_numbers=page_numbers)
-        all_tables.extend(parsed)
+        tables = parse_tables_from_ocr_json(ocr_json, page_numbers=page_numbers)
+        all_tables.extend(tables)
 
     if progress_cb:
         progress_cb(len(chunks), len(chunks), 0, 0)
 
-    return all_tables
+    # 표제부 후보 테이블 찾기
+    pyo_candidates = find_pyo_tables(all_tables)
+
+    # 표제부 정리 DF 만들기
+    pyo_dfs = []
+    pyo_tables = []
+    for (t, header_row, col_map) in pyo_candidates:
+        df = extract_pyo_records_from_table(t, header_row, col_map)
+        if not df.empty:
+            pyo_dfs.append(df)
+            pyo_tables.append(t)
+
+    pyo_df = pd.concat(pyo_dfs, ignore_index=True) if pyo_dfs else pd.DataFrame()
+
+    return all_tables, pyo_df, pyo_tables
 
 
 # ============================================================
-# 7) Streamlit UI
+# 8) Streamlit UI
 # ============================================================
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="📄", layout="wide")
     st.title(APP_TITLE)
-    st.caption(f"{APP_VERSION} | General OCR(enableTableDetection) → tables/cells → Excel")
+    st.caption(f"{APP_VERSION} | Naver Table OCR → 표제부 정리 엑셀")
 
     st.markdown(
         """
-이 버전은 **네이버 CLOVA OCR의 표 추출 기능(enableTableDetection=true)** 을 사용해서  
-응답에 포함된 `tables -> cells(rowIndex/columnIndex/rowSpan/columnSpan)` 정보를 기반으로 **표를 엑셀로 그대로** 만듭니다.
+### 이 앱이 하는 일
+- **네이버 표추출 OCR(enableTableDetection)** 로 PDF 전체를 인식한 뒤  
+- **토지 등기 '표제부' 테이블만** 자동으로 찾아서  
+- **보기 좋은 형태(정리된 표)** 로 재가공한 엑셀을 만들어줍니다.
 
-✅ 표 추출 사용 전 체크:
-- 네이버 클라우드 콘솔 → CLOVA OCR → Domain → **General** 도메인
-- **‘표 추출 여부’ 토글을 ON** 해야 동작합니다. (OFF면 에러)
+> 표 추출은 도메인 설정에서 **‘표 추출 여부’가 ON**이어야 합니다.
 """
     )
 
@@ -582,17 +881,18 @@ def main():
             secret_key = st.text_input("NAVER_SECRET_KEY", type="password")
 
         st.divider()
-        st.header("🧾 추출 옵션")
+        st.header("🧾 OCR 옵션")
         pages_per_req = st.number_input("OCR 요청당 페이지 수(<=10)", min_value=1, max_value=10, value=10, step=1)
         lang = st.selectbox("언어(lang)", options=["ko", "ja", "zh-TW", "ko,ja"], index=0)
 
-        merge_cells = st.checkbox("엑셀에서 셀 병합 반영(rowSpan/columnSpan)", value=True)
-        autosize = st.checkbox("열 너비 자동 조정(대략)", value=True)
+        st.divider()
+        st.header("📦 출력 옵션")
+        include_raw_tables = st.checkbox("표제부 원본 테이블 시트(raw_...)도 포함", value=True)
+        merge_cells = st.checkbox("raw 시트에서 병합셀 반영", value=True)
 
         st.divider()
         st.header("🧠 온톨로지(JSON-LD)")
-        export_jsonld = st.checkbox("JSON-LD도 함께 생성", value=True)
-        include_cells = st.checkbox("JSON-LD에 셀까지 포함(파일 커짐)", value=False)
+        export_jsonld = st.checkbox("표제부 JSON-LD도 생성", value=True)
 
     uploaded_file = st.file_uploader("📎 PDF 업로드", type=["pdf"])
     if uploaded_file is None:
@@ -602,13 +902,13 @@ def main():
     file_bytes = uploaded_file.getvalue()
     file_hash = hashlib.sha256(file_bytes).hexdigest()
 
-    # 파일이 바뀌면 결과 초기화
+    # 파일이 바뀌면 초기화
     if st.session_state.get("file_hash") != file_hash:
-        for k in ["tables", "excel_bytes", "jsonld_obj", "jsonld_bytes"]:
+        for k in ["pyo_df", "pyo_excel", "pyo_tables", "jsonld_obj", "jsonld_bytes"]:
             st.session_state.pop(k, None)
         st.session_state["file_hash"] = file_hash
 
-    clicked = st.button("🚀 표 추출 시작", disabled=not bool(api_url and secret_key))
+    clicked = st.button("🚀 표제부 추출 시작", disabled=not bool(api_url and secret_key))
     if clicked:
         if not api_url or not secret_key:
             st.error("API URL/SECRET을 입력하세요.")
@@ -625,8 +925,8 @@ def main():
             else:
                 status.write("📄 마무리 중...")
 
-        with st.spinner("OCR 및 표 변환 중..."):
-            tables = process_pdf_to_tables(
+        with st.spinner("OCR 및 표제부 정리 중..."):
+            all_tables, pyo_df, pyo_tables = process_pdf(
                 file_bytes,
                 api_url,
                 secret_key,
@@ -635,29 +935,26 @@ def main():
                 progress_cb=progress_cb,
             )
 
-            excel_bytes = tables_to_excel_bytes(tables, merge_cells=merge_cells, autosize=autosize)
+            pyo_excel = build_pyo_excel_bytes(
+                pyo_df=pyo_df,
+                pyo_tables=pyo_tables,
+                merge_cells=merge_cells,
+                include_raw_tables=include_raw_tables,
+            )
 
             jsonld_obj = None
             jsonld_bytes = b""
             if export_jsonld:
-                jsonld_obj = build_tables_jsonld(
+                jsonld_obj = build_pyo_jsonld(
                     file_name=uploaded_file.name,
                     file_hash=file_hash,
-                    tables=tables,
-                    include_cells=include_cells,
-                    include_bboxes=True,
-                    config={
-                        "pages_per_request": int(pages_per_req),
-                        "lang": str(lang),
-                        "merge_cells": bool(merge_cells),
-                        "autosize": bool(autosize),
-                        "include_cells_in_jsonld": bool(include_cells),
-                    },
+                    pyo_df=pyo_df,
                 )
                 jsonld_bytes = make_jsonld_bytes(jsonld_obj)
 
-        st.session_state["tables"] = tables
-        st.session_state["excel_bytes"] = excel_bytes
+        st.session_state["pyo_df"] = pyo_df
+        st.session_state["pyo_excel"] = pyo_excel
+        st.session_state["pyo_tables"] = pyo_tables
         st.session_state["jsonld_obj"] = jsonld_obj
         st.session_state["jsonld_bytes"] = jsonld_bytes
 
@@ -665,64 +962,50 @@ def main():
         status.write("✅ 완료")
 
     # 결과 표시
-    if st.session_state.get("tables") is not None:
-        tables: List[ParsedTable] = st.session_state["tables"]
-        excel_bytes: bytes = st.session_state.get("excel_bytes", b"")
+    if st.session_state.get("pyo_df") is not None:
+        pyo_df: pd.DataFrame = st.session_state.get("pyo_df") or pd.DataFrame()
+        pyo_excel: bytes = st.session_state.get("pyo_excel", b"")
+        pyo_tables: List[ParsedTable] = st.session_state.get("pyo_tables") or []
         jsonld_bytes: bytes = st.session_state.get("jsonld_bytes", b"")
 
         st.divider()
-        st.subheader(f"✅ 추출된 표 수: {len(tables)}")
+        st.subheader("✅ 표제부 정리 결과")
 
         col1, col2 = st.columns([1, 1])
 
         with col1:
-            if excel_bytes:
+            st.write(f"- 표제부 후보 테이블 수: **{len(pyo_tables)}**")
+            st.write(f"- 정리 레코드 수(표제부 행): **{len(pyo_df)}**")
+
+            if pyo_excel:
                 st.download_button(
-                    "📥 엑셀 다운로드(표마다 시트 + index)",
-                    data=excel_bytes,
-                    file_name=f"{uploaded_file.name}_tables.xlsx",
+                    "📥 표제부 전용 엑셀 다운로드",
+                    data=pyo_excel,
+                    file_name=f"{uploaded_file.name}_표제부.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="download_excel",
+                    key="download_pyo_excel",
                 )
 
             if export_jsonld and jsonld_bytes:
                 st.download_button(
-                    "🧠 JSON-LD 다운로드(표 그래프)",
+                    "🧠 표제부 JSON-LD 다운로드",
                     data=jsonld_bytes,
-                    file_name=f"{uploaded_file.name}_tables.jsonld",
+                    file_name=f"{uploaded_file.name}_표제부.jsonld",
                     mime="application/ld+json",
-                    key="download_jsonld",
+                    key="download_pyo_jsonld",
                 )
-
-            # index 표
-            idx = []
-            for t in tables:
-                bbox_s = ""
-                if t.bbox:
-                    bbox_s = f"{t.bbox[0]:.1f},{t.bbox[1]:.1f},{t.bbox[2]:.1f},{t.bbox[3]:.1f}"
-                idx.append(
-                    {
-                        "sheet": t.sheet_name,
-                        "page": t.page_no,
-                        "table_idx": t.table_index_on_page,
-                        "rows": t.n_rows,
-                        "cols": t.n_cols,
-                        "bbox": bbox_s,
-                    }
-                )
-            st.subheader("📌 표 목록(index)")
-            st.dataframe(pd.DataFrame(idx), use_container_width=True, hide_index=True)
 
         with col2:
-            st.subheader("🔎 표 미리보기")
-            if tables:
-                options = [f"{t.sheet_name} (p{t.page_no}, {t.n_rows}x{t.n_cols})" for t in tables]
-                sel = st.selectbox("표 선택", options, index=0)
-                t = tables[options.index(sel)]
-                st.dataframe(pd.DataFrame(t.grid), use_container_width=True, hide_index=True)
+            if pyo_df.empty:
+                st.warning("표제부 테이블을 찾지 못했어요. (표제부 헤더 인식 실패 가능)")
+                st.caption("팁: 원본 PDF가 너무 기울어져 있거나 표선이 약하면 표추출이 실패할 수 있어요.")
+            else:
+                st.dataframe(pyo_df, use_container_width=True, hide_index=True)
+
             if export_jsonld:
                 with st.expander("🧠 JSON-LD 미리보기", expanded=False):
                     st.json(st.session_state.get("jsonld_obj", {}))
+
     else:
         st.info("추출을 실행하면 결과가 여기에 표시됩니다.")
 
