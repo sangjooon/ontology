@@ -56,7 +56,7 @@ from openpyxl.utils import get_column_letter
 # 0) 앱 설정
 # ============================================================
 APP_TITLE = "문서 비서📄 dev — 토지 등기 표제부 전용"
-APP_VERSION = "v0.5.0"
+APP_VERSION = "v0.5.1"
 
 DEFAULT_PASSWORD = "alohomora"  # 데모용
 MAX_PAGES_PER_REQUEST = 10      # Naver General OCR PDF 최대 10페이지/요청
@@ -963,7 +963,9 @@ def main():
 
     # 결과 표시
     if st.session_state.get("pyo_df") is not None:
-        pyo_df: pd.DataFrame = st.session_state.get("pyo_df") or pd.DataFrame()
+        pyo_df_obj = st.session_state.get("pyo_df")
+        # pandas.DataFrame는 bool 컨텍스트(or/and)에서 ValueError가 발생하므로 명시적으로 처리
+        pyo_df: pd.DataFrame = pyo_df_obj if isinstance(pyo_df_obj, pd.DataFrame) else pd.DataFrame()
         pyo_excel: bytes = st.session_state.get("pyo_excel", b"")
         pyo_tables: List[ParsedTable] = st.session_state.get("pyo_tables") or []
         jsonld_bytes: bytes = st.session_state.get("jsonld_bytes", b"")
