@@ -50,7 +50,7 @@ from openpyxl.utils import get_column_letter
 # 0) 앱 설정
 # ============================================================
 APP_TITLE = "문서 비서📄 dev — 토지 등기(표제부+갑구) 정리"
-APP_VERSION = "v0.6.1"
+APP_VERSION = "v0.6.2"
 
 DEFAULT_PASSWORD = "alohomora"  # 데모용
 MAX_PAGES_PER_REQUEST = 10      # Naver General OCR PDF 최대 10페이지/요청
@@ -465,7 +465,111 @@ def split_area_and_note(area_text: str) -> Tuple[str, str]:
     return area_only, note
 
 
+
+# -----------------------------
+# 표제부 컬럼 추정(헤더 인식 실패/병합 헤더 대비)
+# -----------------------------
+_LOT_RE = re.compile(r"\b(\d{1,5}-\d{1,5})\b")
+
+
+def _score_is_display_no(v: str) -> int:
+    s = (v or "").strip()
+    return 1 if re.fullmatch(r"\d+(?:-\d+)?", s) else 0
+
+
+def _score_is_area(v: str) -> int:
+    s = (v or "").strip().replace(" ", "")
+    return 1 if re.search(r"(?i)\d+(?:,\d+)*(?:\.\d+)?(m2|m²|㎡)", s) else 0
+
+
+def _score_is_land_category(v: str) -> int:
+    s = normalize_land_category(v)
+    return 1 if s in LAND_CATEGORIES else 0
+
+
+def _score_is_acceptance(v: str) -> int:
+    s = (v or "").strip()
+    # 날짜(YYYY년M월D일) 또는 접수번호(제xxxx호) 패턴
+    if re.search(r"\d{4}\s*년\s*\d{1,2}\s*월\s*\d{1,2}\s*일", s):
+        return 2
+    if re.search(r"제\s*\d+\s*호", s):
+        return 1
+    return 0
+
+
+def _score_is_address(v: str) -> int:
+    s = (v or "").strip()
+    score = 0
+    if _LOT_RE.search(s):
+        score += 2
+    if re.search(r"(시|군|구|읍|면|동|리)", s):
+        score += 1
+    if "소재지" in s or "지번" in s:
+        score += 1
+    return score
+
+
+def infer_pyo_col_map(t: ParsedTable, header_row: int) -> Dict[str, int]:
+    """
+    헤더가 병합/오독으로 컬럼명이 안 보이는 경우를 위해,
+    데이터 행 패턴으로 표제부 컬럼을 추정한다.
+    """
+    # 샘플링 범위
+    r0 = header_row + 1
+    r1 = min(t.n_rows, header_row + 1 + 30)
+
+    # 컬럼별 점수 계산
+    scores = []
+    for c in range(t.n_cols):
+        disp = area = cat = acc = addr = 0
+        for r in range(r0, r1):
+            v = (t.grid[r][c] or "").strip()
+            if not v:
+                continue
+            disp += _score_is_display_no(v)
+            area += _score_is_area(v)
+            cat += _score_is_land_category(v)
+            acc += _score_is_acceptance(v)
+            addr += _score_is_address(v)
+        scores.append({"c": c, "disp": disp, "area": area, "cat": cat, "acc": acc, "addr": addr})
+
+    # best columns
+    c_disp = max(scores, key=lambda x: x["disp"])["c"] if scores else 0
+    c_area = max(scores, key=lambda x: x["area"])["c"] if scores else min(3, t.n_cols - 1)
+    c_cat = max(scores, key=lambda x: x["cat"])["c"] if scores else max(0, min(c_area - 1, t.n_cols - 1))
+
+    # address는 지목 앞쪽에서 찾는 게 안전
+    cand_addr = [s for s in scores if s["c"] < c_cat]
+    c_addr = max(cand_addr, key=lambda x: x["addr"])["c"] if cand_addr else max(0, min(c_cat - 1, t.n_cols - 1))
+
+    # acceptance는 표시번호 다음~소재지번 이전에서 찾는 게 안전
+    cand_acc = [s for s in scores if c_disp < s["c"] < c_addr]
+    if cand_acc:
+        c_acc = max(cand_acc, key=lambda x: x["acc"])["c"]
+    else:
+        c_acc = min(c_disp + 1, t.n_cols - 1)
+
+    col_map = {
+        "display_no": c_disp,
+        "acceptance": c_acc,
+        "lot_address": c_addr,
+        "land_category": c_cat,
+        "area": c_area,
+    }
+
+    # 순서가 뒤집힌 경우 보정(최소한 display_no < land_category < area)
+    if not (col_map["display_no"] < col_map["land_category"] < col_map["area"]):
+        # land_category/area가 바뀐 경우가 많음 → swap 시도
+        if col_map["display_no"] < col_map["area"] < col_map["land_category"]:
+            col_map["land_category"], col_map["area"] = col_map["area"], col_map["land_category"]
+
+    return col_map
 def find_pyo_tables(tables: List[ParsedTable]) -> List[Tuple[ParsedTable, int, Dict[str, int]]]:
+    """
+    표제부 테이블 후보 탐색.
+    - 헤더가 명확하면 헤더 기반 매핑
+    - 헤더가 병합/오독이면 데이터 패턴으로 컬럼 추정(infer_pyo_col_map)
+    """
     out: List[Tuple[ParsedTable, int, Dict[str, int]]] = []
 
     for t in tables:
@@ -473,16 +577,25 @@ def find_pyo_tables(tables: List[ParsedTable]) -> List[Tuple[ParsedTable, int, D
             continue
 
         header_row = -1
-        for r in range(min(t.n_rows, 8)):
+        for r in range(min(t.n_rows, 15)):  # ✅ 탐색 범위 확대
             row_norm = _norm(" ".join(t.grid[r]))
             hits = {k: 1 for k, spec in PYO_ONTOLOGY.items() if _contains_any(row_norm, spec["aliases"])}
-            if ("display_no" in hits) and (len(hits) >= 3):
+
+            # 케이스1) 표시번호 포함 + 최소 3개 필드 히트
+            cond1 = ("display_no" in hits) and (len(hits) >= 3)
+            # 케이스2) 표시번호가 안 보여도 소재지번/지목/면적 3종이 보이면 표제부로 간주
+            cond2 = ("lot_address" in hits) and ("land_category" in hits) and ("area" in hits)
+            # 케이스3) '표제부' 텍스트가 섞여 있고 지목/면적이 보이면 표제부 가능성
+            cond3 = ("표제부" in row_norm) and (("land_category" in hits) and ("area" in hits))
+
+            if cond1 or cond2 or cond3:
                 header_row = r
                 break
 
         if header_row < 0:
             continue
 
+        # 1차: 헤더 기반 매핑
         col_map: Dict[str, int] = {}
         for c in range(t.n_cols):
             cell_norm = _norm(t.grid[header_row][c])
@@ -503,21 +616,26 @@ def find_pyo_tables(tables: List[ParsedTable]) -> List[Tuple[ParsedTable, int, D
                 col_map["area"] = c
                 continue
 
-        # fallback
-        if "display_no" not in col_map:
-            col_map["display_no"] = 0
-        if "land_category" not in col_map or "area" not in col_map:
-            continue
-        if "lot_address" not in col_map:
-            col_map["lot_address"] = max(0, min(col_map["land_category"] - 1, t.n_cols - 1))
+        # 2차: 부족한 컬럼은 데이터 패턴으로 추정
+        need_infer = ("land_category" not in col_map) or ("area" not in col_map) or ("lot_address" not in col_map)
+        if need_infer:
+            inferred = infer_pyo_col_map(t, header_row)
+            for k, v in inferred.items():
+                col_map.setdefault(k, v)
+
+        # acceptance가 없으면 표시번호 다음칸으로 보수적 추정
+        col_map.setdefault("display_no", 0)
         if "acceptance" not in col_map:
             cand = col_map.get("display_no", 0) + 1
-            if cand < col_map.get("lot_address", cand + 1) and cand < t.n_cols:
+            if cand < t.n_cols:
                 col_map["acceptance"] = cand
 
-        # sanity (표제부는 보통 표시번호 < 지목 < 면적)
+        # sanity: 표시번호 < 지목 < 면적 (일반적)
         if not (col_map["display_no"] < col_map["land_category"] < col_map["area"]):
-            continue
+            # 마지막으로 infer 재시도(간혹 헤더 매핑이 뒤틀림)
+            col_map = infer_pyo_col_map(t, header_row)
+            if not (col_map["display_no"] < col_map["land_category"] < col_map["area"]):
+                continue
 
         out.append((t, header_row, col_map))
 
@@ -805,6 +923,23 @@ EUL_PURPOSE_KEYWORDS = [
 ]
 
 
+def _purpose_type(purpose_text: str) -> str:
+    """
+    등기목적 텍스트 기반으로 갑구/을구 성격을 판정.
+    return: 'gab' | 'eul' | 'unknown'
+    """
+    n = _norm(purpose_text or "")
+    gab = 0
+    eul = 0
+    if any(k in n for k in map(_norm, GAB_PURPOSE_KEYWORDS)):
+        gab += 1
+    if any(k in n for k in map(_norm, EUL_PURPOSE_KEYWORDS)):
+        eul += 1
+    if gab == 0 and eul == 0:
+        return "unknown"
+    return "gab" if gab >= eul else "eul"
+
+
 def guess_section_by_purpose_keywords(t: ParsedTable, header_row: int, col_map: Dict[str, int]) -> str:
     """
     '등기목적' 텍스트를 보고 갑구/을구를 추정하는 백업 로직.
@@ -886,6 +1021,13 @@ def extract_gab_records_from_table(t: ParsedTable, header_row: int, col_map: Dic
     if df.empty:
         return df
 
+    # ✅ 을구(근저당/전세권/지상권 등) 성격의 행이 섞이면 갑구 결과가 깨지므로 제거
+    if "등기목적" in df.columns:
+        df["_ptype"] = df["등기목적"].apply(_purpose_type)
+        df = df[df["_ptype"] != "eul"].drop(columns=["_ptype"], errors="ignore")
+        if df.empty:
+            return df
+
     # 정렬(순위번호)
     def rank_key(x: Any) -> Tuple[int, int, str]:
         s = str(x or "").strip()
@@ -965,6 +1107,76 @@ def assign_table_to_group(groups: List[ParcelGroup], page_no: int) -> Optional[P
         if g.start_page <= page_no <= g.end_page:
             return g
     return None
+
+
+# -----------------------------
+# (보강) 갑구 테이블을 지번(필지) 그룹에 더 정확히 매핑하기 위한 lot 추정
+# -----------------------------
+_LOT_SHORT_RE = re.compile(r"\b(\d{1,5}-\d{1,5})\b")
+
+
+def guess_lot_from_lines(page_lines: List[PageLine]) -> str:
+    """
+    페이지의 텍스트 라인에서 지번 후보를 추정.
+    - 1~5자리-1~5자리 패턴만 사용(주민/법인번호 등 긴 패턴 배제)
+    - '리/동/지번/소재지' 같은 문맥이 있으면 가중치
+    """
+    if not page_lines:
+        return ""
+
+    scores: Dict[str, float] = {}
+    # 상단부에 보통 소재지가 있으므로 위쪽(작은 y)부터 30줄만
+    lines_sorted = sorted(page_lines, key=lambda x: x.y)[:30]
+    for ln in lines_sorted:
+        txt = ln.text or ""
+        for lot in _LOT_SHORT_RE.findall(txt):
+            sc = 1.0
+            if re.search(r"(리|동)\s*" + re.escape(lot), txt):
+                sc += 2.0
+            if ("소재지" in txt) or ("지번" in txt) or ("토지" in txt):
+                sc += 1.0
+            # 위쪽일수록 가중치(0~1)
+            sc += max(0.0, 1.0 - (ln.y / 2000.0))
+            scores[lot] = scores.get(lot, 0.0) + sc
+
+    if not scores:
+        return ""
+
+    # 최고점 lot 반환
+    return max(scores.items(), key=lambda x: x[1])[0]
+
+
+def guess_lot_from_table_text(t: ParsedTable) -> str:
+    """
+    테이블 텍스트에서 지번 후보를 추정.
+    - 권리자/기타사항에 주소(…리 496-10)가 들어가는 케이스가 많아 효과적
+    """
+    scores: Dict[str, float] = {}
+    # 너무 큰 테이블도 있으니, 상단 40행 정도만
+    max_r = min(t.n_rows, 40)
+    for r in range(max_r):
+        row_txt = " ".join((t.grid[r][c] or "") for c in range(t.n_cols))
+        for lot in _LOT_SHORT_RE.findall(row_txt):
+            sc = 1.0
+            if re.search(r"(리|동)\s*" + re.escape(lot), row_txt):
+                sc += 2.0
+            scores[lot] = scores.get(lot, 0.0) + sc
+
+    if not scores:
+        return ""
+    return max(scores.items(), key=lambda x: x[1])[0]
+
+
+def guess_lot_key_for_gab_table(t: ParsedTable, page_lines: List[PageLine]) -> str:
+    """
+    갑구 테이블의 지번 key 추정:
+    1) 테이블 텍스트에서 추정
+    2) 실패 시 페이지 라인에서 추정
+    """
+    lot = guess_lot_from_table_text(t)
+    if lot:
+        return lot
+    return guess_lot_from_lines(page_lines)
 
 
 # ============================================================
@@ -1306,9 +1518,16 @@ def process_pdf(
     for (t, header_row, col_map) in gab_candidates:
         # 1차: 페이지 라벨(갑구/을구) 기반 분류
         section = classify_gab_or_eul(t, all_page_lines.get(t.page_no, []))
+
         # 2차: 라벨이 안 잡히면 등기목적 키워드로 추정
         if section == "unknown":
             section = guess_section_by_purpose_keywords(t, header_row, col_map)
+
+        # 3차: 라벨이 '갑구'로 찍혔더라도, 실제 내용이 을구 키워드가 압도하면 을구로 뒤집기(오탐 방지)
+        if section in ("갑구", "을구"):
+            by_kw = guess_section_by_purpose_keywords(t, header_row, col_map)
+            if by_kw != "unknown" and by_kw != section:
+                section = by_kw
 
         if section != "갑구":
             continue  # ✅ 지금은 갑구만
@@ -1317,13 +1536,33 @@ def process_pdf(
         if df.empty:
             continue
 
-        g = assign_table_to_group(groups, t.page_no)
+        # ✅ 표제부가 누락되어도 갑구 표 안에서 지번이 나오는 경우가 많음 → 지번 기반으로 그룹 매핑
+        lot_key = guess_lot_key_for_gab_table(t, all_page_lines.get(t.page_no, []))
+
+        # 그룹 dict(동적) 구성
+        by_key = {gg.key: gg for gg in groups}
+
+        g: Optional[ParcelGroup] = None
+        if lot_key:
+            g = by_key.get(lot_key)
+            if g is None:
+                # 표제부를 못 찾은 지번이라도 갑구에서 지번이 추정되면 그룹 생성
+                g = ParcelGroup(key=lot_key, start_page=t.page_no, end_page=total_pages)
+                groups.append(g)
+                gab_df_by_group.setdefault(g.key, [])
+            # start_page 보강
+            g.start_page = min(g.start_page, t.page_no)
+        else:
+            # 지번 추정 실패 → 기존 방식(페이지 범위)로 할당
+            g = assign_table_to_group(groups, t.page_no)
+
         if g is None:
-            # UNKNOWN에 넣기
+            # 마지막 fallback: UNKNOWN
             g = next((x for x in groups if x.key == "UNKNOWN"), None)
             if g is None:
                 g = ParcelGroup(key="UNKNOWN", start_page=1, end_page=total_pages)
                 groups.append(g)
+                gab_df_by_group.setdefault(g.key, [])
 
         g.gab_tables.append(t)
         gab_df_by_group.setdefault(g.key, []).append(df)
@@ -1344,8 +1583,24 @@ def process_pdf(
         if isinstance(g.pyo_df, pd.DataFrame) and not g.pyo_df.empty:
             g.pyo_df = g.pyo_df.drop_duplicates()
 
-    # 그룹 정렬(시작 페이지)
+    # --------------------
+    # 그룹 범위 재계산(표제부를 못 찾은 지번이 갑구에서 추가된 경우 대비)
+    # --------------------
+    # start_page 보강: pyo_tables/gab_tables의 최소 페이지로 재계산
+    for g in groups:
+        pages = []
+        pages.extend([t.page_no for t in g.pyo_tables])
+        pages.extend([t.page_no for t in g.gab_tables])
+        if pages:
+            g.start_page = min([g.start_page] + pages)
+
     groups.sort(key=lambda x: x.start_page)
+
+    for i in range(len(groups)):
+        if i < len(groups) - 1:
+            groups[i].end_page = max(groups[i].start_page, groups[i + 1].start_page - 1)
+        else:
+            groups[i].end_page = total_pages
 
     return groups, total_pages
 
@@ -1542,4 +1797,3 @@ def _render_group(g: ParcelGroup):
 
 if __name__ == "__main__":
     main()
-
