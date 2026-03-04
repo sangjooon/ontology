@@ -56,7 +56,7 @@ from openpyxl.utils import get_column_letter
 # 0) 앱 설정
 # ============================================================
 APP_TITLE = "문서 비서📄 dev — 토지 등기 표제부 전용"
-APP_VERSION = "v0.5.2"
+APP_VERSION = "v0.5.3"
 
 DEFAULT_PASSWORD = "alohomora"  # 데모용
 MAX_PAGES_PER_REQUEST = 10      # Naver General OCR PDF 최대 10페이지/요청
@@ -343,7 +343,7 @@ def normalize_land_category(raw: str) -> str:
 
 
 def parse_area_to_number(area_text: str) -> Optional[float]:
-    s = (area_text or "").replace(",", " ")
+    s = (area_text or "").replace(",", "")
     m = re.search(r"(\d+(?:\.\d+)?)", s)
     if not m:
         return None
@@ -351,6 +351,36 @@ def parse_area_to_number(area_text: str) -> Optional[float]:
         return float(m.group(1))
     except Exception:
         return None
+
+
+
+
+def split_area_and_note(area_text: str) -> Tuple[str, str]:
+    """
+    면적 텍스트에서 '숫자+단위(m2/㎡/m²)'를 분리하고,
+    나머지를 '등기원인 및 기타사항'으로 돌려준다.
+
+    예)
+      '1540m2 분할로 인하여 ...' -> ('1540m2', '분할로 인하여 ...')
+      '1,540 ㎡' -> ('1540m2', '')
+      '지목변경' -> ('', '지목변경')  # 면적 패턴이 없으면 note로 처리
+    """
+    s = (area_text or "").strip()
+    if not s:
+        return "", ""
+
+    m = re.search(r"(?i)(\d+(?:,\d+)*(?:\.\d+)?)\s*(m2|m²|㎡)", s)
+    if not m:
+        return "", s
+
+    num_raw = m.group(1)
+    num = num_raw.replace(",", "")
+    area_only = f"{num}m2"
+
+    note = s[m.end():].strip()
+    note = re.sub(r"^[\s:;,.\)\]]+", "", note).strip()
+
+    return area_only, note
 
 
 def extract_lot_no(addr: str) -> str:
