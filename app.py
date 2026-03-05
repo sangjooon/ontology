@@ -50,7 +50,7 @@ from openpyxl.utils import get_column_letter
 # 0) 앱 설정
 # ============================================================
 APP_TITLE = "문서 비서📄 dev — 토지 등기(표제부+갑구) 정리"
-APP_VERSION = "v0.6.3"
+APP_VERSION = "v0.6.4"
 
 DEFAULT_PASSWORD = "alohomora"  # 데모용
 MAX_PAGES_PER_REQUEST = 10      # Naver General OCR PDF 최대 10페이지/요청
@@ -1189,7 +1189,7 @@ def group_parcels_from_pyo(
         if i < len(groups) - 1:
             groups[i].end_page = max(groups[i].start_page, groups[i + 1].start_page - 1)
         else:
-            groups[i].end_page = last_registry_page
+            groups[i].end_page = total_pages
 
     return groups
 
