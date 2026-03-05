@@ -50,7 +50,7 @@ from openpyxl.utils import get_column_letter
 # 0) 앱 설정
 # ============================================================
 APP_TITLE = "문서 비서📄 dev — 토지 등기(표제부+갑구) 정리"
-APP_VERSION = "v0.6.2"
+APP_VERSION = "v0.6.3"
 
 DEFAULT_PASSWORD = "alohomora"  # 데모용
 MAX_PAGES_PER_REQUEST = 10      # Naver General OCR PDF 최대 10페이지/요청
@@ -351,6 +351,57 @@ def _norm(s: str) -> str:
     return s.lower()
 
 
+# -----------------------------
+# 페이지 유형 판별(토지 등기 페이지만 선별)
+# -----------------------------
+REGISTRY_MARKERS = [
+    "등기사항전부증명서",
+    "주요등기사항요약",
+    "주요 등기사항 요약",
+    "표제부",
+    "갑구",
+    "을구",
+    "매매목록",
+    "매 매 목 록",
+    "부동산의 표시",
+]
+
+
+def is_registry_like_page(page_lines: List[PageLine]) -> bool:
+    """
+    등기(토지/건물) 페이지인지 대략 판별.
+    """
+    if not page_lines:
+        return False
+    txt = _norm(" ".join((ln.text or "") for ln in page_lines))
+    return any(_norm(m) in txt for m in REGISTRY_MARKERS)
+
+
+def is_land_registry_page(page_lines: List[PageLine]) -> bool:
+    """
+    '토지 등기' 페이지인지 판별.
+    - 등기 마커가 있고
+    - '건물' 제출용이 아닌 페이지(건물 등기는 제외)
+    - '토지' 단서가 있으면 더 신뢰, 없으면(ocr 누락)도 마커가 충분하면 통과
+    """
+    if not is_registry_like_page(page_lines):
+        return False
+
+    txt = _norm(" ".join((ln.text or "") for ln in page_lines))
+
+    # 건물 등기 페이지는 제외 (제출용 헤더에 '건물'이 잘 잡히는 편)
+    if "건물" in txt and "토지" not in txt:
+        return False
+
+    # 토지 단서가 있으면 OK
+    if "토지" in txt or "[토지]" in txt:
+        return True
+
+    # OCR이 토지/건물 단서를 놓친 경우: 마커가 2개 이상이면 토지로 간주(보수적)
+    hit_cnt = sum(1 for m in REGISTRY_MARKERS if _norm(m) in txt)
+    return hit_cnt >= 2
+
+
 def _contains_any(norm_text: str, aliases: List[str]) -> bool:
     for a in aliases:
         if _norm(a) and _norm(a) in norm_text:
@@ -434,10 +485,51 @@ def normalize_land_category(raw: str) -> str:
 
 
 def extract_lot_no(addr: str) -> str:
+    """
+    소재지/주소 문자열에서 '지번' 후보를 추출.
+    - 날짜(2018-01 등), 아파트 동-호(105-1103, 307-804 등) 같은 하이픈 숫자를 최대한 배제
+    - '...리496-10', '...동 1429-1' 처럼 **리/동/가** 뒤에 오는 패턴을 우선시
+    """
     s = (addr or "").strip()
-    m = re.findall(r"\d{1,5}-\d{1,5}", s)
-    if m:
-        return m[-1]
+
+    # 1) 문맥(리/동/가) 기반 우선 매치
+    ctx = re.findall(r"[가-힣]{1,15}(?:리|동|가)\s*(\d{1,5}-\d{1,5})", s)
+    candidates = ctx[:]  # copy
+
+    # 2) 일반 하이픈 숫자도 후보로 넣되, 필터링
+    candidates += re.findall(r"\b(\d{1,5}-\d{1,5})\b", s)
+
+    def is_plausible_lot(tok: str) -> bool:
+        try:
+            a, b = tok.split("-", 1)
+            ia = int(a)
+            ib = int(b)
+        except Exception:
+            return False
+
+        # (1) 날짜 패턴 제거: 1900-2100 / 월 1-12
+        if 1900 <= ia <= 2100 and 1 <= ib <= 12:
+            return False
+
+        # (2) 아파트 동-호(105-1103 등) 제거: 두 번째가 너무 큼
+        if ib >= 1000:
+            return False
+
+        # (3) 3자리-3자리(307-804 등) 제거(지번에서 매우 드뭄)
+        if len(a) == 3 and len(b) == 3:
+            return False
+
+        return True
+
+    candidates = [c for c in candidates if is_plausible_lot(c)]
+    if candidates:
+        # ctx(문맥매치)가 있으면 그 중 마지막을, 없으면 전체 후보 중 마지막을 반환
+        for c in reversed(ctx):
+            if c in candidates:
+                return c
+        return candidates[-1]
+
+    # 3) 마지막 fallback: 단일 숫자
     m2 = re.findall(r"(?:^|\s)(\d{1,5})(?:\s|$)", s)
     if m2:
         return m2[-1].strip()
@@ -1097,7 +1189,7 @@ def group_parcels_from_pyo(
         if i < len(groups) - 1:
             groups[i].end_page = max(groups[i].start_page, groups[i + 1].start_page - 1)
         else:
-            groups[i].end_page = total_pages
+            groups[i].end_page = last_registry_page
 
     return groups
 
@@ -1477,21 +1569,34 @@ def process_pdf(
     if progress_cb:
         progress_cb(len(chunks), len(chunks), 0, 0)
 
+        # --------------------
+    # ✅ 토지 등기 관련 페이지만 선별 (토지이용계획확인서/토지대장/건물 등기 등은 제외)
     # --------------------
+    land_registry_pages = {p for p, lines in all_page_lines.items() if is_land_registry_page(lines)}
+    if land_registry_pages:
+        tables_for_registry = [t for t in all_tables if t.page_no in land_registry_pages]
+    else:
+        # 토지 등기 페이지 판별 실패 시(극단적 OCR 실패)에는 전체를 사용(최후의 fallback)
+        tables_for_registry = all_tables
+
+    # 그룹 페이지 범위는 '토지 등기' 마지막 페이지 기준이 더 자연스러움
+    last_registry_page = max(land_registry_pages) if land_registry_pages else total_pages
+
+# --------------------
     # 표제부 추출
     # --------------------
-    pyo_candidates = find_pyo_tables(all_tables)
+    pyo_candidates = find_pyo_tables(tables_for_registry)
     pyo_items: List[Tuple[ParsedTable, pd.DataFrame]] = []
     for (t, header_row, col_map) in pyo_candidates:
         df = extract_pyo_records_from_table(t, header_row, col_map)
         if not df.empty:
             pyo_items.append((t, df))
 
-    groups = group_parcels_from_pyo(pyo_items, total_pages=total_pages)
+    groups = group_parcels_from_pyo(pyo_items, total_pages=last_registry_page)
 
     # 표제부가 하나도 없으면 UNKNOWN 그룹 하나 생성
     if not groups:
-        groups = [ParcelGroup(key="UNKNOWN", start_page=1, end_page=total_pages)]
+        groups = [ParcelGroup(key="UNKNOWN", start_page=1, end_page=last_registry_page)]
 
     # 그룹에 표제부 테이블/DF 할당
     # (group_parcels_from_pyo가 이미 할당했지만, UNKNOWN 케이스 대비)
@@ -1502,7 +1607,7 @@ def process_pdf(
             g = by_key.get(key)
             if g is None:
                 # 새 그룹 생성(예외)
-                g = ParcelGroup(key=key, start_page=t.page_no, end_page=total_pages)
+                g = ParcelGroup(key=key, start_page=t.page_no, end_page=last_registry_page)
                 groups.append(g)
                 by_key[key] = g
             g.pyo_tables.append(t)
@@ -1511,7 +1616,7 @@ def process_pdf(
     # --------------------
     # 갑구 추출
     # --------------------
-    gab_candidates = find_gab_tables(all_tables)
+    gab_candidates = find_gab_tables(tables_for_registry)
 
     gab_df_by_group: Dict[str, List[pd.DataFrame]] = {g.key: [] for g in groups}
 
@@ -1536,31 +1641,16 @@ def process_pdf(
         if df.empty:
             continue
 
-        # ✅ 표제부가 누락되어도 갑구 표 안에서 지번이 나오는 경우가 많음 → 지번 기반으로 그룹 매핑
-        lot_key = guess_lot_key_for_gab_table(t, all_page_lines.get(t.page_no, []))
+        # ✅ 기본: 표제부(start_page) 기반 페이지 범위로 그룹 할당
+        g = assign_table_to_group(groups, t.page_no)
 
-        # 그룹 dict(동적) 구성
-        by_key = {gg.key: gg for gg in groups}
-
-        g: Optional[ParcelGroup] = None
-        if lot_key:
-            g = by_key.get(lot_key)
-            if g is None:
-                # 표제부를 못 찾은 지번이라도 갑구에서 지번이 추정되면 그룹 생성
-                g = ParcelGroup(key=lot_key, start_page=t.page_no, end_page=total_pages)
-                groups.append(g)
-                gab_df_by_group.setdefault(g.key, [])
-            # start_page 보강
-            g.start_page = min(g.start_page, t.page_no)
-        else:
-            # 지번 추정 실패 → 기존 방식(페이지 범위)로 할당
-            g = assign_table_to_group(groups, t.page_no)
+        # 표제부가 아예 없거나, 범위로도 못 붙이면 마지막 fallback(UNKNOWN)
 
         if g is None:
             # 마지막 fallback: UNKNOWN
             g = next((x for x in groups if x.key == "UNKNOWN"), None)
             if g is None:
-                g = ParcelGroup(key="UNKNOWN", start_page=1, end_page=total_pages)
+                g = ParcelGroup(key="UNKNOWN", start_page=1, end_page=last_registry_page)
                 groups.append(g)
                 gab_df_by_group.setdefault(g.key, [])
 
@@ -1600,7 +1690,7 @@ def process_pdf(
         if i < len(groups) - 1:
             groups[i].end_page = max(groups[i].start_page, groups[i + 1].start_page - 1)
         else:
-            groups[i].end_page = total_pages
+            groups[i].end_page = last_registry_page
 
     return groups, total_pages
 
