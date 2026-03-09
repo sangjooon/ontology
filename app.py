@@ -50,7 +50,7 @@ from openpyxl.utils import get_column_letter
 # 0) 앱 설정
 # ============================================================
 APP_TITLE = "문서 비서📄 dev — 토지 등기(표제부+갑구) 정리"
-APP_VERSION = "v0.6.4"
+APP_VERSION = "v0.7.0"
 
 DEFAULT_PASSWORD = "alohomora"  # 데모용
 MAX_PAGES_PER_REQUEST = 10      # Naver General OCR PDF 최대 10페이지/요청
@@ -365,6 +365,65 @@ REGISTRY_MARKERS = [
     "매 매 목 록",
     "부동산의 표시",
 ]
+
+
+OTHER_DOC_MARKERS = [
+    "토지이용계획확인서",
+    "지적도",
+    "토지 대장",
+    "토지대장",
+    "공유지 연명부",
+    "공유지연명부",
+    "건축물대장",
+    "일반건축물대장",
+    "집합건축물대장",
+    "건축물대장 총괄표제부",
+]
+
+
+def compute_land_registry_pages(all_page_lines: Dict[int, List[PageLine]], total_pages: int) -> List[int]:
+    """
+    '등기사항전부증명서 - 토지[제출용]' 시작 페이지를 기준으로
+    그 다음 페이지들(연속)을 토지등기 구간으로 간주한다.
+
+    ✅ 이유
+    - 갑/을구가 이어지는 페이지는 '갑구/을구' 라벨이 없을 수 있어,
+      단순 키워드 필터로는 중간 페이지가 빠지면서(예: 8-2 → 18) 순위번호가 점프함.
+    - 시작 페이지의 문서 헤더(토지/건물 제출용)를 가장 신뢰하고, 상태를 carry 한다.
+    """
+    mode = "other"  # land | building | other
+    pages: List[int] = []
+
+    for p in range(1, total_pages + 1):
+        lines = all_page_lines.get(p, [])
+        txt = _norm(" ".join((ln.text or "") for ln in lines))
+
+        if not txt:
+            # 텍스트가 거의 없는 페이지는 이전 mode를 유지 (워터마크/이하여백 등)
+            if mode == "land":
+                pages.append(p)
+            continue
+
+        if "등기사항전부증명서" in txt:
+            # 제출용 유형 판별
+            if ("토지" in txt) or ("[토지]" in txt):
+                mode = "land"
+            elif ("건물" in txt) or ("[건물]" in txt):
+                mode = "building"
+            else:
+                # 토지/건물 단서가 없으면 직전 mode 유지 (보수적)
+                # 단, 직전이 land면 land를 유지
+                mode = mode
+
+        elif any(_norm(m) in txt for m in OTHER_DOC_MARKERS):
+            mode = "other"
+
+        if mode == "land":
+            pages.append(p)
+
+    # 중복 제거 + 정렬 보장
+    pages = sorted(set(pages))
+    return pages
 
 
 def is_registry_like_page(page_lines: List[PageLine]) -> bool:
@@ -826,6 +885,92 @@ def extract_pyo_records_from_table(t: ParsedTable, header_row: int, col_map: Dic
     return df[[c for c in cols if c in df.columns]]
 
 
+def extract_eul_records_from_table(t: ParsedTable, header_row: int, col_map: Dict[str, int]) -> pd.DataFrame:
+    """
+    을구(소유권 이외의 권리) 테이블에서 레코드 추출.
+    구조는 갑구와 동일하지만, 갑구 성격 행(소유권/압류 등)이 섞이면 제거한다.
+    """
+    c_rank = col_map["rank"]
+    c_purpose = col_map["purpose"]
+    c_acc = col_map["acceptance"]
+    c_cause = col_map["cause"]
+    c_holder = col_map["holder"]
+
+    records: List[Dict[str, Any]] = []
+    cur: Optional[Dict[str, Any]] = None
+
+    for r in range(header_row + 1, t.n_rows):
+        row = t.grid[r]
+        if all((not (row[c] or "").strip()) for c in range(t.n_cols)):
+            continue
+
+        rank = (row[c_rank] or "").strip()
+
+        # 잡음/헤더 반복 제거
+        if rank and _contains_any(_norm(rank), ["순위번호", "갑구", "을구", "표제부"]):
+            continue
+
+        purpose = join_cols(row, c_purpose, c_acc, sep="\n") if c_purpose < c_acc else (row[c_purpose] or "").strip()
+        acc = join_cols(row, c_acc, c_cause, sep="\n") if c_acc < c_cause else (row[c_acc] or "").strip()
+        cause = join_cols(row, c_cause, c_holder, sep="\n") if c_cause < c_holder else (row[c_cause] or "").strip()
+        holder = join_cols(row, c_holder, t.n_cols, sep="\n")
+
+        # continuation: 순위번호가 비어있고 내용이 있으면 이전 레코드에 병합
+        is_cont = (not rank) and (purpose or acc or cause or holder)
+        if is_cont and cur is not None:
+            if purpose:
+                cur["등기목적"] = (cur["등기목적"] + "\n" + purpose).strip() if cur["등기목적"] else purpose
+            if acc:
+                cur["접수"] = (cur["접수"] + "\n" + acc).strip() if cur["접수"] else acc
+            if cause:
+                cur["등기원인"] = (cur["등기원인"] + "\n" + cause).strip() if cur["등기원인"] else cause
+            if holder:
+                cur["권리자 및 기타사항"] = (
+                    (cur.get("권리자 및 기타사항") or "").strip() + "\n" + holder
+                ).strip() if (cur.get("권리자 및 기타사항") or "").strip() else holder
+            continue
+
+        if rank:
+            cur = {
+                "페이지": t.page_no,
+                "table_id": t.table_id,
+                "순위번호": rank,
+                "등기목적": purpose,
+                "접수": acc,
+                "등기원인": cause,
+                "권리자 및 기타사항": holder,
+            }
+            records.append(cur)
+
+    df = pd.DataFrame(records)
+    if df.empty:
+        return df
+
+    # ✅ 갑구 성격의 행이 섞이면 을구 결과가 깨지므로 제거
+    if "등기목적" in df.columns:
+        df["_ptype"] = df["등기목적"].apply(_purpose_type)
+        df = df[df["_ptype"] != "gab"].drop(columns=["_ptype"], errors="ignore")
+        if df.empty:
+            return df
+
+    # 정렬(순위번호)
+    def rank_key(x: Any) -> Tuple[int, int, str]:
+        s = str(x or "").strip()
+        m = re.match(r"^(\d+)(?:-(\d+))?", s)
+        if not m:
+            return (10**9, 0, s)
+        a = int(m.group(1))
+        b = int(m.group(2) or 0)
+        return (a, b, s)
+
+    df["_rk"] = df["순위번호"].apply(rank_key)
+    df = df.sort_values("_rk").drop(columns=["_rk"])
+
+    cols = ["페이지", "table_id", "순위번호", "등기목적", "접수", "등기원인", "권리자 및 기타사항"]
+    return df[[c for c in cols if c in df.columns]]
+
+
+
 # ============================================================
 # 6) 갑구 추출/정리
 # ============================================================
@@ -1149,6 +1294,8 @@ class ParcelGroup:
     pyo_df: pd.DataFrame = field(default_factory=pd.DataFrame)
     gab_tables: List[ParsedTable] = field(default_factory=list)
     gab_df: pd.DataFrame = field(default_factory=pd.DataFrame)
+    eul_tables: List[ParsedTable] = field(default_factory=list)
+    eul_df: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 def _pick_group_key_from_pyo_df(df: pd.DataFrame, fallback: str) -> str:
@@ -1320,12 +1467,13 @@ def build_registry_excel_bytes(
     groups: List[ParcelGroup],
     include_raw_pyo: bool,
     include_raw_gab: bool,
+    include_raw_eul: bool,
     merge_cells_on_raw: bool,
 ) -> bytes:
     wb = Workbook()
     ws_index = wb.active
     ws_index.title = "INDEX"
-    ws_index.append(["지번(그룹)", "페이지범위", "표제부 행수", "갑구 행수", "표제부 테이블 수", "갑구 테이블 수"])
+    ws_index.append(["지번(그룹)", "페이지범위", "표제부 행수", "갑구 행수", "을구 행수", "표제부 테이블 수", "갑구 테이블 수", "을구 테이블 수"])
 
     used = {"INDEX"}
 
@@ -1337,8 +1485,10 @@ def build_registry_excel_bytes(
             f"{g.start_page}-{g.end_page}",
             int(len(g.pyo_df)) if isinstance(g.pyo_df, pd.DataFrame) else 0,
             int(len(g.gab_df)) if isinstance(g.gab_df, pd.DataFrame) else 0,
+            int(len(g.eul_df)) if isinstance(g.eul_df, pd.DataFrame) else 0,
             len(g.pyo_tables),
             len(g.gab_tables),
+            len(g.eul_tables),
         ])
 
         # 표제부 시트
@@ -1361,7 +1511,18 @@ def build_registry_excel_bytes(
         else:
             _write_df(ws_gab, gab_export)
 
-        # raw tables (선택)
+        
+        # 을구 시트
+        eul_df = g.eul_df if isinstance(g.eul_df, pd.DataFrame) else pd.DataFrame()
+        eul_cols_clean = ["순위번호", "등기목적", "접수", "등기원인", "권리자 및 기타사항"]
+        eul_export = eul_df[[c for c in eul_cols_clean if c in eul_df.columns]].copy() if not eul_df.empty else pd.DataFrame(columns=eul_cols_clean)
+        ws_eul = wb.create_sheet(_safe_sheet_name(f"을구_{g.key}", used))
+        if eul_export.empty:
+            ws_eul.append(["을구 없음"])
+        else:
+            _write_df(ws_eul, eul_export)
+
+# raw tables (선택)
         wrap = Alignment(wrap_text=True, vertical="top")
 
         def write_raw_table(t: ParsedTable, sheet_prefix: str):
@@ -1384,6 +1545,10 @@ def build_registry_excel_bytes(
         if include_raw_gab:
             for t in g.gab_tables:
                 write_raw_table(t, "rawGAB")
+
+        if include_raw_eul:
+            for t in g.eul_tables:
+                write_raw_table(t, "rawEUL")
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -1420,6 +1585,7 @@ def build_registry_jsonld(
         "Parcel": "dovi:Parcel",
         "Fact": "dovi:Fact",
         "GabEntry": "dovi:GabEntry",
+        "EulEntry": "dovi:EulEntry",
 
         "fileName": "schema:name",
         "fileHash": "dovi:fileHash",
@@ -1429,6 +1595,7 @@ def build_registry_jsonld(
         "mentionsParcel": {"@id": "dovi:mentionsParcel", "@type": "@id"},
         "hasFact": {"@id": "dovi:hasFact", "@type": "@id"},
         "hasGabEntry": {"@id": "dovi:hasGabEntry", "@type": "@id"},
+        "hasEulEntry": {"@id": "dovi:hasEulEntry", "@type": "@id"},
 
         "lot": "dovi:lot",
         "siteAddress": "dovi:siteAddress",
@@ -1478,6 +1645,7 @@ def build_registry_jsonld(
             "siteAddress": addr,
             "hasFact": [],
             "hasGabEntry": [],
+            "hasEulEntry": [],
         }
         graph.append(parcel_node)
 
@@ -1515,6 +1683,31 @@ def build_registry_jsonld(
                     }
                 )
                 parcel_node["hasGabEntry"].append(eid)
+
+
+        # 을구 Entries
+        if isinstance(g.eul_df, pd.DataFrame) and not g.eul_df.empty:
+            for _, row in g.eul_df.iterrows():
+                rank = str(row.get("순위번호", "") or "").strip()
+                purpose = str(row.get("등기목적", "") or "").strip()
+                acc = str(row.get("접수", "") or "").strip()
+                cause = str(row.get("등기원인", "") or "").strip()
+                holder = str(row.get("권리자 및 기타사항", "") or "").strip()
+                if not (rank or purpose or acc or cause or holder):
+                    continue
+                eid = f"{pid}#eul-{hashlib.sha1((rank+'|'+purpose+'|'+acc).encode('utf-8')).hexdigest()[:12]}"
+                graph.append(
+                    {
+                        "@id": eid,
+                        "@type": "EulEntry",
+                        "rankNo": rank,
+                        "purpose": purpose,
+                        "acceptance": acc,
+                        "cause": cause,
+                        "holderNote": holder,
+                    }
+                )
+                parcel_node["hasEulEntry"].append(eid)
 
     return {"@context": context, "@graph": graph}
 
@@ -1572,9 +1765,10 @@ def process_pdf(
         # --------------------
     # ✅ 토지 등기 관련 페이지만 선별 (토지이용계획확인서/토지대장/건물 등기 등은 제외)
     # --------------------
-    land_registry_pages = {p for p, lines in all_page_lines.items() if is_land_registry_page(lines)}
+    land_registry_pages = compute_land_registry_pages(all_page_lines, total_pages)
+
     if land_registry_pages:
-        tables_for_registry = [t for t in all_tables if t.page_no in land_registry_pages]
+        tables_for_registry = [t for t in all_tables if t.page_no in set(land_registry_pages)]
     else:
         # 토지 등기 페이지 판별 실패 시(극단적 OCR 실패)에는 전체를 사용(최후의 fallback)
         tables_for_registry = all_tables
@@ -1614,13 +1808,29 @@ def process_pdf(
             g.pyo_df = pd.concat([g.pyo_df, df], ignore_index=True) if isinstance(g.pyo_df, pd.DataFrame) and not g.pyo_df.empty else df
 
     # --------------------
-    # 갑구 추출
+    # 갑/을구 추출
     # --------------------
-    gab_candidates = find_gab_tables(tables_for_registry)
+    sec_candidates = find_gab_tables(tables_for_registry)
 
+    # 그룹별 DF 누적
     gab_df_by_group: Dict[str, List[pd.DataFrame]] = {g.key: [] for g in groups}
+    eul_df_by_group: Dict[str, List[pd.DataFrame]] = {g.key: [] for g in groups}
 
-    for (t, header_row, col_map) in gab_candidates:
+    # 처리 순서 안정화: (page_no, bbox_y0, table_id)
+    def _tbl_sort_key(x: Tuple[ParsedTable, int, Dict[str, int]]) -> Tuple[int, float, str]:
+        t, header_row, col_map = x
+        y0 = 0.0
+        if t.bbox:
+            y0 = float(t.bbox[1])
+        else:
+            ys = [float(c.bbox[1]) for c in t.cells if c.bbox]
+            if ys:
+                y0 = min(ys)
+        return (int(t.page_no), y0, str(t.table_id))
+
+    sec_candidates.sort(key=_tbl_sort_key)
+
+    for (t, header_row, col_map) in sec_candidates:
         # 1차: 페이지 라벨(갑구/을구) 기반 분류
         section = classify_gab_or_eul(t, all_page_lines.get(t.page_no, []))
 
@@ -1628,23 +1838,25 @@ def process_pdf(
         if section == "unknown":
             section = guess_section_by_purpose_keywords(t, header_row, col_map)
 
-        # 3차: 라벨이 '갑구'로 찍혔더라도, 실제 내용이 을구 키워드가 압도하면 을구로 뒤집기(오탐 방지)
+        # 3차: 라벨이 잡혀도 내용 키워드가 더 신뢰되면 뒤집기
         if section in ("갑구", "을구"):
             by_kw = guess_section_by_purpose_keywords(t, header_row, col_map)
             if by_kw != "unknown" and by_kw != section:
                 section = by_kw
 
-        if section != "갑구":
-            continue  # ✅ 지금은 갑구만
+        if section not in ("갑구", "을구"):
+            continue
 
-        df = extract_gab_records_from_table(t, header_row, col_map)
+        if section == "갑구":
+            df = extract_gab_records_from_table(t, header_row, col_map)
+        else:
+            df = extract_eul_records_from_table(t, header_row, col_map)
+
         if df.empty:
             continue
 
         # ✅ 기본: 표제부(start_page) 기반 페이지 범위로 그룹 할당
         g = assign_table_to_group(groups, t.page_no)
-
-        # 표제부가 아예 없거나, 범위로도 못 붙이면 마지막 fallback(UNKNOWN)
 
         if g is None:
             # 마지막 fallback: UNKNOWN
@@ -1653,22 +1865,36 @@ def process_pdf(
                 g = ParcelGroup(key="UNKNOWN", start_page=1, end_page=last_registry_page)
                 groups.append(g)
                 gab_df_by_group.setdefault(g.key, [])
+                eul_df_by_group.setdefault(g.key, [])
 
-        g.gab_tables.append(t)
-        gab_df_by_group.setdefault(g.key, []).append(df)
+        if section == "갑구":
+            g.gab_tables.append(t)
+            gab_df_by_group.setdefault(g.key, []).append(df)
+        else:
+            g.eul_tables.append(t)
+            eul_df_by_group.setdefault(g.key, []).append(df)
 
-    # 그룹별 gab_df finalize
+    # 그룹별 DF finalize
     for g in groups:
-        dfs = gab_df_by_group.get(g.key) or []
-        if dfs:
-            gab_df = pd.concat(dfs, ignore_index=True).drop_duplicates()
-            # 컬럼 정리
+        # 갑구
+        gdfs = gab_df_by_group.get(g.key) or []
+        if gdfs:
+            gab_df = pd.concat(gdfs, ignore_index=True).drop_duplicates()
             cols = ["페이지", "table_id", "순위번호", "등기목적", "접수", "등기원인", "권리자 및 기타사항"]
             g.gab_df = gab_df[[c for c in cols if c in gab_df.columns]]
         else:
             g.gab_df = pd.DataFrame(columns=["순위번호", "등기목적", "접수", "등기원인", "권리자 및 기타사항"])
 
-    # 표제부 DF 중복 제거
+        # 을구
+        edfs = eul_df_by_group.get(g.key) or []
+        if edfs:
+            eul_df = pd.concat(edfs, ignore_index=True).drop_duplicates()
+            cols = ["페이지", "table_id", "순위번호", "등기목적", "접수", "등기원인", "권리자 및 기타사항"]
+            g.eul_df = eul_df[[c for c in cols if c in eul_df.columns]]
+        else:
+            g.eul_df = pd.DataFrame(columns=["순위번호", "등기목적", "접수", "등기원인", "권리자 및 기타사항"])
+
+# 표제부 DF 중복 제거
     for g in groups:
         if isinstance(g.pyo_df, pd.DataFrame) and not g.pyo_df.empty:
             g.pyo_df = g.pyo_df.drop_duplicates()
@@ -1681,6 +1907,7 @@ def process_pdf(
         pages = []
         pages.extend([t.page_no for t in g.pyo_tables])
         pages.extend([t.page_no for t in g.gab_tables])
+        pages.extend([t.page_no for t in g.eul_tables])
         if pages:
             g.start_page = min([g.start_page] + pages)
 
@@ -1742,11 +1969,12 @@ def main():
         st.header("📦 출력 옵션")
         include_raw_pyo = st.checkbox("표제부 raw 테이블 시트 포함", value=False)
         include_raw_gab = st.checkbox("갑구 raw 테이블 시트 포함", value=False)
+        include_raw_eul = st.checkbox("을구 raw 테이블 시트 포함", value=False)
         merge_cells_on_raw = st.checkbox("raw 시트에서 병합셀 반영", value=True)
 
         st.divider()
         st.header("🧠 온톨로지(JSON-LD)")
-        export_jsonld = st.checkbox("표제부+갑구 JSON-LD 생성", value=False)
+        export_jsonld = st.checkbox("표제부+갑구+을구 JSON-LD 생성", value=False)
 
     uploaded_file = st.file_uploader("📎 PDF 업로드", type=["pdf"])
     if uploaded_file is None:
@@ -1792,6 +2020,7 @@ def main():
                 groups=groups,
                 include_raw_pyo=include_raw_pyo,
                 include_raw_gab=include_raw_gab,
+                include_raw_eul=include_raw_eul,
                 merge_cells_on_raw=merge_cells_on_raw,
             )
 
@@ -1830,7 +2059,7 @@ def main():
     # 다운로드
     if excel_bytes:
         st.download_button(
-            "📥 엑셀 다운로드 (지번별 시트: 표제부/갑구)",
+            "📥 엑셀 다운로드 (지번별 시트: 표제부/갑구/을구)",
             data=excel_bytes,
             file_name=f"{uploaded_file.name}_등기정리.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1872,7 +2101,11 @@ def _render_group(g: ParcelGroup):
     if pyo_df.empty:
         st.info("표제부 없음")
     else:
-        st.dataframe(pyo_df[[c for c in pyo_cols if c in pyo_df.columns]], use_container_width=True, hide_index=True)
+        st.dataframe(
+            pyo_df[[c for c in pyo_cols if c in pyo_df.columns]],
+            use_container_width=True,
+            hide_index=True,
+        )
 
     # 갑구
     st.markdown("#### 갑구")
@@ -1880,9 +2113,29 @@ def _render_group(g: ParcelGroup):
     gab_cols = ["순위번호", "등기목적", "접수", "등기원인", "권리자 및 기타사항"]
     if gab_df.empty:
         st.info("갑구 없음(또는 갑구 표 검출 실패)")
-        st.caption("팁: '갑 구' 라벨이 OCR로 안 잡혀도, 이제는 등기목적(소유권/근저당 등) 키워드로 2차 추정합니다. 그래도 비면 표 자체가 tables로 검출되지 않았을 가능성이 큽니다.")
+        st.caption(
+            "팁: '갑 구' 라벨이 OCR로 안 잡혀도, 이제는 등기목적(소유권/근저당 등) 키워드로 2차 추정합니다. "
+            "그래도 비면 표 자체가 tables로 검출되지 않았을 가능성이 큽니다."
+        )
     else:
-        st.dataframe(gab_df[[c for c in gab_cols if c in gab_df.columns]], use_container_width=True, hide_index=True)
+        st.dataframe(
+            gab_df[[c for c in gab_cols if c in gab_df.columns]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    # 을구
+    st.markdown("#### 을구")
+    eul_df = g.eul_df if isinstance(g.eul_df, pd.DataFrame) else pd.DataFrame()
+    eul_cols = ["순위번호", "등기목적", "접수", "등기원인", "권리자 및 기타사항"]
+    if eul_df.empty:
+        st.info("을구 없음(또는 을구 표 검출 실패)")
+    else:
+        st.dataframe(
+            eul_df[[c for c in eul_cols if c in eul_df.columns]],
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
 if __name__ == "__main__":
