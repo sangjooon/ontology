@@ -49,7 +49,7 @@ from openpyxl.utils import get_column_letter
 # ============================================================
 # 0) 앱 설정
 # ============================================================
-APP_TITLE = "문서 비서📄 dev — 토지 등기(표제부+갑구) 정리"
+APP_TITLE = "DOVI 📄 dev — 토지 등기(표제부+갑구+을구) 정리"
 APP_VERSION = "v0.7.0"
 
 DEFAULT_PASSWORD = "alohomora"  # 데모용
@@ -381,7 +381,25 @@ OTHER_DOC_MARKERS = [
 ]
 
 
-def compute_land_registry_pages(all_page_lines: Dict[int, List[PageLine]], total_pages: int) -> List[int]:
+LAND_HEADER_MARKERS = [
+    "토지[제출용]",
+    "토지(제출용)",
+    "토지 제출용",
+]
+
+BUILDING_HEADER_MARKERS = [
+    "건물[제출용]",
+    "건물(제출용)",
+    "건물 제출용",
+]
+
+
+def compute_land_registry_pages(
+    all_page_lines: Dict[int, List[PageLine]],
+    total_pages: int,
+    *,
+    trace: Optional[List[Dict[str, Any]]] = None,
+) -> List[int]:
     """
     '등기사항전부증명서 - 토지[제출용]' 시작 페이지를 기준으로
     그 다음 페이지들(연속)을 토지등기 구간으로 간주한다.
@@ -394,32 +412,89 @@ def compute_land_registry_pages(all_page_lines: Dict[int, List[PageLine]], total
     mode = "other"  # land | building | other
     pages: List[int] = []
 
-    for p in range(1, total_pages + 1):
-        lines = all_page_lines.get(p, [])
-        txt = _norm(" ".join((ln.text or "") for ln in lines))
+    def _top_text(lines: List[PageLine], limit: int = 12) -> str:
+        if not lines:
+            return ""
+        top = sorted(lines, key=lambda x: x.y)[:limit]
+        return _norm(" ".join((ln.text or "") for ln in top))
 
-        if not txt:
+    def _first_hit(txt: str, markers: List[str]) -> str:
+        for m in markers:
+            if _norm(m) in txt:
+                return m
+        return ""
+
+    for p in range(1, total_pages + 1):
+        prev_mode = mode
+        lines = all_page_lines.get(p, [])
+        txt_full = _norm(" ".join((ln.text or "") for ln in lines))
+        txt_top = _top_text(lines)
+        scan_txt = txt_top or txt_full
+        reason = "carry"
+
+        if not txt_full:
             # 텍스트가 거의 없는 페이지는 이전 mode를 유지 (워터마크/이하여백 등)
-            if mode == "land":
+            include_land = mode == "land"
+            if include_land:
                 pages.append(p)
+            reason = "empty-carry"
+            if trace is not None:
+                trace.append(
+                    {
+                        "page": p,
+                        "line_count": len(lines),
+                        "mode_before": prev_mode,
+                        "mode_after": mode,
+                        "included": include_land,
+                        "reason": reason,
+                    }
+                )
             continue
 
-        if "등기사항전부증명서" in txt:
+        if "등기사항전부증명서" in scan_txt or "등기사항전부증명서" in txt_full:
             # 제출용 유형 판별
-            if ("토지" in txt) or ("[토지]" in txt):
+            header_txt = scan_txt if "등기사항전부증명서" in scan_txt else txt_full
+            land_hit = _first_hit(header_txt, LAND_HEADER_MARKERS)
+            building_hit = _first_hit(header_txt, BUILDING_HEADER_MARKERS)
+
+            if land_hit and not building_hit:
                 mode = "land"
-            elif ("건물" in txt) or ("[건물]" in txt):
+                reason = f"header-land:{land_hit}"
+            elif building_hit and not land_hit:
                 mode = "building"
+                reason = f"header-building:{building_hit}"
+            elif ("토지" in header_txt) and ("건물" not in header_txt):
+                mode = "land"
+                reason = "header-land-token"
+            elif ("건물" in header_txt) and ("토지" not in header_txt):
+                mode = "building"
+                reason = "header-building-token"
             else:
                 # 토지/건물 단서가 없으면 직전 mode 유지 (보수적)
-                # 단, 직전이 land면 land를 유지
-                mode = mode
+                reason = f"header-unknown-carry:{mode}"
 
-        elif any(_norm(m) in txt for m in OTHER_DOC_MARKERS):
-            mode = "other"
+        else:
+            other_hit = _first_hit(scan_txt, OTHER_DOC_MARKERS)
+            if other_hit:
+                mode = "other"
+                reason = f"other-doc:{other_hit}"
+            else:
+                reason = f"carry:{mode}"
 
-        if mode == "land":
+        include_land = mode == "land"
+        if include_land:
             pages.append(p)
+        if trace is not None:
+            trace.append(
+                {
+                    "page": p,
+                    "line_count": len(lines),
+                    "mode_before": prev_mode,
+                    "mode_after": mode,
+                    "included": include_land,
+                    "reason": reason,
+                }
+            )
 
     # 중복 제거 + 정렬 보장
     pages = sorted(set(pages))
@@ -550,13 +625,12 @@ def extract_lot_no(addr: str) -> str:
     - '...리496-10', '...동 1429-1' 처럼 **리/동/가** 뒤에 오는 패턴을 우선시
     """
     s = (addr or "").strip()
+    if not s:
+        return ""
 
-    # 1) 문맥(리/동/가) 기반 우선 매치
-    ctx = re.findall(r"[가-힣]{1,15}(?:리|동|가)\s*(\d{1,5}-\d{1,5})", s)
-    candidates = ctx[:]  # copy
-
-    # 2) 일반 하이픈 숫자도 후보로 넣되, 필터링
-    candidates += re.findall(r"\b(\d{1,5}-\d{1,5})\b", s)
+    raw_matches = list(re.finditer(r"(?<!\d)(\d{1,5}-\d{1,5})(?!\d)", s))
+    candidates: List[str] = []
+    ctx_matches: List[str] = []
 
     def is_plausible_lot(tok: str) -> bool:
         try:
@@ -580,18 +654,56 @@ def extract_lot_no(addr: str) -> str:
 
         return True
 
-    candidates = [c for c in candidates if is_plausible_lot(c)]
+    def is_unit_number_context(start: int, end: int) -> bool:
+        left = s[max(0, start - 20):start]
+        right = s[end:min(len(s), end + 12)]
+
+        # 예: 105동 307-804호 / 2층 201-2호
+        if re.search(r"\d{1,4}\s*동\s*$", left):
+            return True
+        if re.search(r"\d{1,3}\s*층\s*$", left):
+            return True
+        if re.match(r"^\s*(동|층|호|호수|호실)", right):
+            return True
+        if re.match(r"^\s*\d{1,4}\s*호", right):
+            return True
+        return False
+
+    def has_lot_context(start: int, end: int) -> bool:
+        left = s[max(0, start - 20):start]
+        right = s[end:min(len(s), end + 10)]
+        if re.search(r"[가-힣]{1,15}(?:리|동|가|읍|면)\s*$", left):
+            return True
+        if re.match(r"^\s*번지", right):
+            return True
+        if re.search(r"(소재지|지번)\s*$", left):
+            return True
+        return False
+
+    for m in raw_matches:
+        tok = m.group(1)
+        st, ed = m.span(1)
+        if not is_plausible_lot(tok):
+            continue
+        if is_unit_number_context(st, ed):
+            continue
+        candidates.append(tok)
+        if has_lot_context(st, ed):
+            ctx_matches.append(tok)
+
     if candidates:
         # ctx(문맥매치)가 있으면 그 중 마지막을, 없으면 전체 후보 중 마지막을 반환
-        for c in reversed(ctx):
+        for c in reversed(ctx_matches):
             if c in candidates:
                 return c
         return candidates[-1]
 
-    # 3) 마지막 fallback: 단일 숫자
-    m2 = re.findall(r"(?:^|\s)(\d{1,5})(?:\s|$)", s)
-    if m2:
-        return m2[-1].strip()
+    # 3) 마지막 fallback: 단일 숫자(지번 문맥이 있는 경우만)
+    fallback_ctx: List[str] = []
+    fallback_ctx += re.findall(r"[가-힣]{1,15}(?:리|동|가|읍|면)\s*(\d{1,5})(?:\s*번지)?", s)
+    fallback_ctx += re.findall(r"(?:지번|번지)\s*(\d{1,5})", s)
+    if fallback_ctx:
+        return fallback_ctx[-1].strip()
     return ""
 
 
@@ -1065,20 +1177,6 @@ def classify_gab_or_eul(table: ParsedTable, page_lines: List[PageLine]) -> str:
         if is_eul_marker(row_text):
             return "을구"
 
-    return "unknown"
-
-    y0 = table.bbox[1]
-    # 테이블 위 260px 범위에서 가장 가까운 라인
-    cand = [ln for ln in page_lines if ln.y < y0 and (y0 - ln.y) <= 260]
-    if not cand:
-        return "unknown"
-    cand.sort(key=lambda ln: ln.y, reverse=True)
-    text_norm = _norm(cand[0].text)
-
-    if "갑구" in text_norm or ("갑" in text_norm and "구" in text_norm and "을구" not in text_norm):
-        return "갑구"
-    if "을구" in text_norm or ("을" in text_norm and "구" in text_norm):
-        return "을구"
     return "unknown"
 
 
@@ -1556,7 +1654,7 @@ def build_registry_excel_bytes(
 
 
 # ============================================================
-# 9) JSON-LD(온톨로지) — 표제부 + 갑구
+# 9) JSON-LD(온톨로지) — 표제부 + 갑구 + 을구
 # ============================================================
 def build_registry_jsonld(
     *,
@@ -1568,7 +1666,7 @@ def build_registry_jsonld(
 ) -> Dict[str, Any]:
     """
     매우 단순한 JSON-LD 그래프:
-      Document -> Parcel -> Facts(표제부) + GabEntry(갑구 항목)
+      Document -> Parcel -> Facts(표제부) + GabEntry(갑구 항목) + EulEntry(을구 항목)
     """
     base = base_iri if base_iri.endswith(("/", "#", ":")) else base_iri + ":"
     doc_id = f"{base}document:{file_hash}"
@@ -1719,6 +1817,69 @@ def make_jsonld_bytes(obj: Dict[str, Any]) -> bytes:
 # ============================================================
 # 10) 전체 처리
 # ============================================================
+def _parse_rank_token(rank: Any) -> Optional[Tuple[int, int, str]]:
+    s = str(rank or "").strip()
+    m = re.match(r"^(\d+)(?:-(\d+))?$", s)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2) or 0), s
+
+
+def _find_rank_jump_warnings(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """
+    순위번호 흐름에서 큰 점프(예: 8-2 → 18)를 디버그용으로 탐지.
+    """
+    if df is None or df.empty or "순위번호" not in df.columns:
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        parsed = _parse_rank_token(row.get("순위번호", ""))
+        if parsed is None:
+            continue
+        main_no, sub_no, rank_raw = parsed
+        page_no_raw = row.get("페이지", 0)
+        page_no = int(page_no_raw) if str(page_no_raw).strip().isdigit() else 0
+        rows.append(
+            {
+                "main": main_no,
+                "sub": sub_no,
+                "rank": rank_raw,
+                "page": page_no,
+                "table_id": str(row.get("table_id", "") or ""),
+            }
+        )
+
+    if len(rows) < 2:
+        return []
+
+    rows.sort(key=lambda x: (x["main"], x["sub"], x["page"], x["table_id"]))
+    warnings: List[Dict[str, Any]] = []
+
+    prev = rows[0]
+    for cur in rows[1:]:
+        is_jump = False
+        if cur["main"] > prev["main"] + 1:
+            is_jump = True
+        elif cur["main"] == prev["main"] and cur["sub"] > prev["sub"] + 1:
+            is_jump = True
+
+        if is_jump:
+            warnings.append(
+                {
+                    "from_rank": prev["rank"],
+                    "to_rank": cur["rank"],
+                    "from_page": prev["page"],
+                    "to_page": cur["page"],
+                    "from_table_id": prev["table_id"],
+                    "to_table_id": cur["table_id"],
+                }
+            )
+        prev = cur
+
+    return warnings
+
+
 def process_pdf(
     file_bytes: bytes,
     api_url: str,
@@ -1727,15 +1888,33 @@ def process_pdf(
     pages_per_request: int,
     lang: str,
     progress_cb: Optional[Callable[[int, int, int, int], None]] = None,
-) -> Tuple[List[ParcelGroup], int]:
+    debug: bool = False,
+) -> Tuple[List[ParcelGroup], int, Dict[str, Any]]:
     """
     반환:
-      - groups: 지번별 ParcelGroup 리스트(표제부+갑구)
+      - groups: 지번별 ParcelGroup 리스트(표제부+갑구+을구)
       - total_pages
+      - debug_info: 페이지/테이블 추적 메타
     """
     pages_per_request = max(1, min(int(pages_per_request), MAX_PAGES_PER_REQUEST))
     total_pages = get_pdf_total_pages(file_bytes)
     chunks = split_pdf_into_chunks(file_bytes, pages_per_request)
+
+    debug_info: Dict[str, Any] = {
+        "total_pages": total_pages,
+        "ocr_chunks": [],
+        "land_registry_pages": [],
+        "land_page_trace": [],
+        "table_counts": {},
+        "pyo_candidates": [],
+        "pyo_empty_tables": [],
+        "pyo_accepted_tables": [],
+        "section_candidates": [],
+        "section_skipped_tables": [],
+        "section_accepted_tables": [],
+        "group_ranges": [],
+        "rank_jump_warnings": [],
+    }
 
     all_tables: List[ParsedTable] = []
     all_page_lines: Dict[int, List[PageLine]] = {}
@@ -1758,33 +1937,64 @@ def process_pdf(
         tables, page_lines = parse_tables_and_lines_from_ocr_json(ocr_json, page_numbers=page_numbers)
         all_tables.extend(tables)
         all_page_lines.update(page_lines)
+        if debug:
+            debug_info["ocr_chunks"].append(
+                {
+                    "chunk_index": i,
+                    "start_page": start_p,
+                    "end_page": end_p,
+                    "table_count": len(tables),
+                }
+            )
 
     if progress_cb:
         progress_cb(len(chunks), len(chunks), 0, 0)
 
-        # --------------------
+    # --------------------
     # ✅ 토지 등기 관련 페이지만 선별 (토지이용계획확인서/토지대장/건물 등기 등은 제외)
     # --------------------
-    land_registry_pages = compute_land_registry_pages(all_page_lines, total_pages)
+    land_page_trace: Optional[List[Dict[str, Any]]] = [] if debug else None
+    land_registry_pages = compute_land_registry_pages(all_page_lines, total_pages, trace=land_page_trace)
+    if debug:
+        debug_info["land_registry_pages"] = land_registry_pages
+        debug_info["land_page_trace"] = land_page_trace if land_page_trace is not None else []
 
     if land_registry_pages:
-        tables_for_registry = [t for t in all_tables if t.page_no in set(land_registry_pages)]
+        land_page_set = set(land_registry_pages)
+        tables_for_registry = [t for t in all_tables if t.page_no in land_page_set]
     else:
         # 토지 등기 페이지 판별 실패 시(극단적 OCR 실패)에는 전체를 사용(최후의 fallback)
         tables_for_registry = all_tables
 
+    if debug:
+        debug_info["table_counts"] = {
+            "all_tables": len(all_tables),
+            "registry_tables": len(tables_for_registry),
+        }
+
     # 그룹 페이지 범위는 '토지 등기' 마지막 페이지 기준이 더 자연스러움
     last_registry_page = max(land_registry_pages) if land_registry_pages else total_pages
 
-# --------------------
+    # --------------------
     # 표제부 추출
     # --------------------
     pyo_candidates = find_pyo_tables(tables_for_registry)
     pyo_items: List[Tuple[ParsedTable, pd.DataFrame]] = []
     for (t, header_row, col_map) in pyo_candidates:
+        if debug:
+            debug_info["pyo_candidates"].append(
+                {"page": t.page_no, "table_id": t.table_id, "header_row": header_row}
+            )
         df = extract_pyo_records_from_table(t, header_row, col_map)
-        if not df.empty:
-            pyo_items.append((t, df))
+        if df.empty:
+            if debug:
+                debug_info["pyo_empty_tables"].append({"page": t.page_no, "table_id": t.table_id})
+            continue
+        pyo_items.append((t, df))
+        if debug:
+            debug_info["pyo_accepted_tables"].append(
+                {"page": t.page_no, "table_id": t.table_id, "row_count": int(len(df))}
+            )
 
     groups = group_parcels_from_pyo(pyo_items, total_pages=last_registry_page)
 
@@ -1811,6 +2021,11 @@ def process_pdf(
     # 갑/을구 추출
     # --------------------
     sec_candidates = find_gab_tables(tables_for_registry)
+    if debug:
+        debug_info["section_candidates"] = [
+            {"page": t.page_no, "table_id": t.table_id, "header_row": header_row}
+            for (t, header_row, _col_map) in sec_candidates
+        ]
 
     # 그룹별 DF 누적
     gab_df_by_group: Dict[str, List[pd.DataFrame]] = {g.key: [] for g in groups}
@@ -1832,19 +2047,29 @@ def process_pdf(
 
     for (t, header_row, col_map) in sec_candidates:
         # 1차: 페이지 라벨(갑구/을구) 기반 분류
-        section = classify_gab_or_eul(t, all_page_lines.get(t.page_no, []))
+        section_by_label = classify_gab_or_eul(t, all_page_lines.get(t.page_no, []))
+        section_by_kw = guess_section_by_purpose_keywords(t, header_row, col_map)
+        section = section_by_label
 
         # 2차: 라벨이 안 잡히면 등기목적 키워드로 추정
         if section == "unknown":
-            section = guess_section_by_purpose_keywords(t, header_row, col_map)
+            section = section_by_kw
 
         # 3차: 라벨이 잡혀도 내용 키워드가 더 신뢰되면 뒤집기
-        if section in ("갑구", "을구"):
-            by_kw = guess_section_by_purpose_keywords(t, header_row, col_map)
-            if by_kw != "unknown" and by_kw != section:
-                section = by_kw
+        if section in ("갑구", "을구") and section_by_kw != "unknown" and section_by_kw != section:
+            section = section_by_kw
 
         if section not in ("갑구", "을구"):
+            if debug:
+                debug_info["section_skipped_tables"].append(
+                    {
+                        "page": t.page_no,
+                        "table_id": t.table_id,
+                        "section_by_label": section_by_label,
+                        "section_by_kw": section_by_kw,
+                        "reason": "unknown_section",
+                    }
+                )
             continue
 
         if section == "갑구":
@@ -1853,6 +2078,17 @@ def process_pdf(
             df = extract_eul_records_from_table(t, header_row, col_map)
 
         if df.empty:
+            if debug:
+                debug_info["section_skipped_tables"].append(
+                    {
+                        "page": t.page_no,
+                        "table_id": t.table_id,
+                        "section_by_label": section_by_label,
+                        "section_by_kw": section_by_kw,
+                        "final_section": section,
+                        "reason": "empty_records",
+                    }
+                )
             continue
 
         # ✅ 기본: 표제부(start_page) 기반 페이지 범위로 그룹 할당
@@ -1874,6 +2110,19 @@ def process_pdf(
             g.eul_tables.append(t)
             eul_df_by_group.setdefault(g.key, []).append(df)
 
+        if debug:
+            debug_info["section_accepted_tables"].append(
+                {
+                    "page": t.page_no,
+                    "table_id": t.table_id,
+                    "section_by_label": section_by_label,
+                    "section_by_kw": section_by_kw,
+                    "final_section": section,
+                    "group_key": g.key,
+                    "row_count": int(len(df)),
+                }
+            )
+
     # 그룹별 DF finalize
     for g in groups:
         # 갑구
@@ -1894,7 +2143,7 @@ def process_pdf(
         else:
             g.eul_df = pd.DataFrame(columns=["순위번호", "등기목적", "접수", "등기원인", "권리자 및 기타사항"])
 
-# 표제부 DF 중복 제거
+    # 표제부 DF 중복 제거
     for g in groups:
         if isinstance(g.pyo_df, pd.DataFrame) and not g.pyo_df.empty:
             g.pyo_df = g.pyo_df.drop_duplicates()
@@ -1919,7 +2168,36 @@ def process_pdf(
         else:
             groups[i].end_page = last_registry_page
 
-    return groups, total_pages
+    if debug:
+        debug_info["group_ranges"] = [
+            {
+                "group_key": g.key,
+                "start_page": g.start_page,
+                "end_page": g.end_page,
+                "pyo_rows": int(len(g.pyo_df)) if isinstance(g.pyo_df, pd.DataFrame) else 0,
+                "gab_rows": int(len(g.gab_df)) if isinstance(g.gab_df, pd.DataFrame) else 0,
+                "eul_rows": int(len(g.eul_df)) if isinstance(g.eul_df, pd.DataFrame) else 0,
+            }
+            for g in groups
+        ]
+
+        rank_jump_warnings: List[Dict[str, Any]] = []
+        for g in groups:
+            gab_w = _find_rank_jump_warnings(g.gab_df if isinstance(g.gab_df, pd.DataFrame) else pd.DataFrame())
+            for w in gab_w:
+                w["group_key"] = g.key
+                w["section"] = "갑구"
+                rank_jump_warnings.append(w)
+
+            eul_w = _find_rank_jump_warnings(g.eul_df if isinstance(g.eul_df, pd.DataFrame) else pd.DataFrame())
+            for w in eul_w:
+                w["group_key"] = g.key
+                w["section"] = "을구"
+                rank_jump_warnings.append(w)
+
+        debug_info["rank_jump_warnings"] = rank_jump_warnings
+
+    return groups, total_pages, debug_info
 
 
 # ============================================================
@@ -1928,7 +2206,7 @@ def process_pdf(
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="📄", layout="wide")
     st.title(APP_TITLE)
-    st.caption(f"{APP_VERSION} | Naver Table OCR(enableTableDetection) → 표제부/갑구 정리")
+    st.caption(f"{APP_VERSION} | Naver Table OCR(enableTableDetection) → 표제부/갑구/을구 정리")
 
     st.markdown(
         """
@@ -1936,7 +2214,8 @@ def main():
 - 네이버 **표추출 OCR(enableTableDetection)** 로 PDF 전체를 인식
 - **표제부**: 표시번호/접수/소재지번/지목/면적/등기원인 및 기타사항 정리
 - **갑구**: 순위번호/등기목적/접수/등기원인/권리자 및 기타사항 정리
-- 표제부/갑구가 여러 지번으로 존재하면 **지번별로 표를 분리**해서 보여주고 엑셀 시트도 분리
+- **을구**: 순위번호/등기목적/접수/등기원인/권리자 및 기타사항 정리
+- 표제부/갑구/을구가 여러 지번으로 존재하면 **지번별로 표를 분리**해서 보여주고 엑셀 시트도 분리
 
 > 표 추출은 네이버 콘솔 Domain에서 **‘표 추출 여부’가 ON**이어야 합니다.
 """
@@ -1976,6 +2255,10 @@ def main():
         st.header("🧠 온톨로지(JSON-LD)")
         export_jsonld = st.checkbox("표제부+갑구+을구 JSON-LD 생성", value=False)
 
+        st.divider()
+        st.header("🧪 디버그")
+        debug_extract = st.checkbox("페이지/테이블 ID 디버그 로그 표시", value=False)
+
     uploaded_file = st.file_uploader("📎 PDF 업로드", type=["pdf"])
     if uploaded_file is None:
         st.info("PDF를 업로드하면 시작할 수 있어요.")
@@ -1985,11 +2268,11 @@ def main():
     file_hash = hashlib.sha256(file_bytes).hexdigest()
 
     if st.session_state.get("file_hash") != file_hash:
-        for k in ["groups", "excel_bytes", "jsonld_obj", "jsonld_bytes", "total_pages"]:
+        for k in ["groups", "excel_bytes", "jsonld_obj", "jsonld_bytes", "total_pages", "debug_info"]:
             st.session_state.pop(k, None)
         st.session_state["file_hash"] = file_hash
 
-    clicked = st.button("🚀 표제부+갑구 추출 시작", disabled=not bool(api_url and secret_key))
+    clicked = st.button("🚀 표제부+갑구+을구 추출 시작", disabled=not bool(api_url and secret_key))
     if clicked:
         if not api_url or not secret_key:
             st.error("API URL/SECRET을 입력하세요.")
@@ -2006,14 +2289,15 @@ def main():
             else:
                 status.write("📄 마무리 중...")
 
-        with st.spinner("OCR 및 표제부/갑구 정리 중..."):
-            groups, total_pages = process_pdf(
+        with st.spinner("OCR 및 표제부/갑구/을구 정리 중..."):
+            groups, total_pages, debug_info = process_pdf(
                 file_bytes,
                 api_url,
                 secret_key,
                 pages_per_request=int(pages_per_req),
                 lang=str(lang),
                 progress_cb=progress_cb,
+                debug=bool(debug_extract),
             )
 
             excel_bytes = build_registry_excel_bytes(
@@ -2039,6 +2323,7 @@ def main():
         st.session_state["jsonld_obj"] = jsonld_obj
         st.session_state["jsonld_bytes"] = jsonld_bytes
         st.session_state["total_pages"] = total_pages
+        st.session_state["debug_info"] = debug_info
 
         progress.progress(100)
         status.write("✅ 완료")
@@ -2052,6 +2337,7 @@ def main():
     groups: List[ParcelGroup] = groups_obj
     excel_bytes: bytes = st.session_state.get("excel_bytes", b"")
     jsonld_bytes: bytes = st.session_state.get("jsonld_bytes", b"")
+    debug_info_obj: Dict[str, Any] = st.session_state.get("debug_info", {})
 
     st.divider()
     st.subheader(f"✅ 추출 결과 (지번 그룹 수: {len(groups)})")
@@ -2091,6 +2377,56 @@ def main():
     if export_jsonld:
         with st.expander("🧠 JSON-LD 미리보기", expanded=False):
             st.json(st.session_state.get("jsonld_obj", {}))
+
+    if debug_extract and isinstance(debug_info_obj, dict):
+        _render_debug_info(debug_info_obj)
+
+
+def _render_debug_info(debug_info: Dict[str, Any]):
+    with st.expander("🧪 디버그 로그 (페이지/테이블 ID)", expanded=False):
+        st.caption("보안상 API 키/원문 OCR 텍스트는 표시하지 않고, 페이지/테이블 메타 정보만 표시합니다.")
+
+        land_pages = debug_info.get("land_registry_pages", [])
+        if isinstance(land_pages, list) and len(land_pages) > 0:
+            st.write(f"토지등기 포함 페이지: {land_pages}")
+        else:
+            st.write("토지등기 포함 페이지: 미검출")
+
+        table_counts = debug_info.get("table_counts", {})
+        if isinstance(table_counts, dict) and table_counts:
+            st.write(
+                "테이블 수 요약: "
+                f"전체={table_counts.get('all_tables', 0)}, "
+                f"토지등기 범위={table_counts.get('registry_tables', 0)}"
+            )
+
+        page_trace = debug_info.get("land_page_trace", [])
+        if isinstance(page_trace, list) and len(page_trace) > 0:
+            st.markdown("#### 페이지 모드 추적")
+            st.dataframe(pd.DataFrame(page_trace), use_container_width=True, hide_index=True)
+
+        pyo_empty = debug_info.get("pyo_empty_tables", [])
+        if isinstance(pyo_empty, list) and len(pyo_empty) > 0:
+            st.markdown("#### 표제부 후보 중 빈 결과")
+            st.dataframe(pd.DataFrame(pyo_empty), use_container_width=True, hide_index=True)
+
+        sec_skipped = debug_info.get("section_skipped_tables", [])
+        if isinstance(sec_skipped, list) and len(sec_skipped) > 0:
+            st.markdown("#### 갑/을구 스킵 테이블")
+            st.dataframe(pd.DataFrame(sec_skipped), use_container_width=True, hide_index=True)
+
+        sec_ok = debug_info.get("section_accepted_tables", [])
+        if isinstance(sec_ok, list) and len(sec_ok) > 0:
+            st.markdown("#### 갑/을구 반영 테이블")
+            st.dataframe(pd.DataFrame(sec_ok), use_container_width=True, hide_index=True)
+
+        jumps = debug_info.get("rank_jump_warnings", [])
+        if isinstance(jumps, list) and len(jumps) > 0:
+            st.markdown("#### 순위번호 점프 의심 구간")
+            st.dataframe(pd.DataFrame(jumps), use_container_width=True, hide_index=True)
+        else:
+            st.markdown("#### 순위번호 점프 의심 구간")
+            st.info("디버그 기준으로 점프 의심 구간이 발견되지 않았습니다.")
 
 
 def _render_group(g: ParcelGroup):
