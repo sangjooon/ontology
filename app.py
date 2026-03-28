@@ -615,6 +615,410 @@ def _extract_rank_candidates(text: str) -> List[str]:
     return uniq
 
 
+SEC_DATE_RE_TEXT = r"\d{4}\s*년\s*\d{1,2}\s*월\s*\d{1,2}\s*일"
+SEC_ACCEPTANCE_RE = re.compile(
+    rf"^\s*({SEC_DATE_RE_TEXT}(?:\s*(?:제\s*)?\d+\s*호)?)(?:[\s\n]+(.*))?$",
+    re.S,
+)
+CAUSE_ACTION_PATTERNS = [
+    r"협의분할\s*에\s*의한\s*상속",
+    r"전세권설정계약",
+    r"근저당권설정계약",
+    r"근저당권설정",
+    r"저당권설정",
+    r"전세권설정",
+    r"지상권설정",
+    r"설정계약",
+    r"매매",
+    r"증여",
+    r"상속",
+    r"해지",
+    r"변경",
+    r"말소",
+    r"상호변경",
+    r"판결",
+    r"공매",
+    r"경매",
+    r"신탁",
+    r"교환",
+    r"분할",
+    r"합병",
+    r"가압류",
+    r"압류",
+    r"환매",
+    r"존속기간",
+]
+SEC_CAUSE_ACTION_RE_TEXT = "(?:" + "|".join(CAUSE_ACTION_PATTERNS) + ")"
+SEC_CAUSE_PREFIX_RE = re.compile(
+    rf"^\s*({SEC_DATE_RE_TEXT}(?:\s*{SEC_CAUSE_ACTION_RE_TEXT})?)(?:[\s\n]+(.*))?$",
+    re.S,
+)
+SEC_HOLDER_MARKER_RE = re.compile(
+    r"(채권최고액|근저당권자|저당권자|전세권자|지상권자|가등기권자|권리자|공유자|소유자|채무자|목적|성명|주소|주식회사|지분)"
+)
+SEC_SHORT_HOLDER_LABELS = {
+    "목적",
+    "성명",
+    "주소",
+    "채무자",
+    "권리자",
+    "공유자",
+    "소유자",
+}
+SEC_CAUSE_KEYWORDS = [
+    "매매",
+    "설정계약",
+    "해지",
+    "변경",
+    "말소",
+    "상호변경",
+    "협의분할",
+    "상속",
+    "증여",
+    "판결",
+    "공매",
+    "경매",
+    "신탁",
+    "교환",
+    "분할",
+    "합병",
+    "가압류",
+    "압류",
+    "환매",
+    "존속기간",
+]
+SEC_ADDRESS_MARKER_RE = re.compile(
+    r"(서울|부산|대구|인천|광주|대전|울산|세종|경기|강원|충북|충남|전북|전남|경북|경남|제주)"
+)
+SEC_MONEY_MARKER_RE = re.compile(r"금\s*[\d,]+원")
+
+
+def _normalize_multiline_text(text: str) -> str:
+    s = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"[ \t]+\n", "\n", s)
+    s = re.sub(r"\n[ \t]+", "\n", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def _join_unique_lines(parts: List[str], *, sep: str = "\n") -> str:
+    out: List[str] = []
+    seen: set = set()
+    for part in parts:
+        txt = _normalize_multiline_text(part)
+        if not txt or txt in seen:
+            continue
+        seen.add(txt)
+        out.append(txt)
+    return sep.join(out).strip()
+
+
+def _append_text(base: str, extra: str, *, sep: str = "\n") -> str:
+    base_norm = _normalize_multiline_text(base)
+    extra_norm = _normalize_multiline_text(extra)
+    if not base_norm:
+        return extra_norm
+    if not extra_norm:
+        return base_norm
+    if extra_norm in base_norm:
+        return base_norm
+    if base_norm in extra_norm:
+        return extra_norm
+    parts = base_norm.split("\n") + extra_norm.split("\n")
+    return _join_unique_lines(parts, sep=sep)
+
+
+def _col_interval_from_cells(
+    t: ParsedTable,
+    col_idx: int,
+    *,
+    header_row: int = -1,
+) -> Optional[Tuple[float, float]]:
+    def _pick_cells(require_header: bool, require_single_span: bool) -> List[ParsedCell]:
+        out: List[ParsedCell] = []
+        for pc in t.cells:
+            if int(pc.col) != col_idx or not pc.bbox or not (pc.text or "").strip():
+                continue
+            if require_header and int(pc.row) != header_row:
+                continue
+            if require_single_span and int(pc.col_span) != 1:
+                continue
+            out.append(pc)
+        return out
+
+    candidates: List[ParsedCell] = []
+    if header_row >= 0:
+        candidates = _pick_cells(require_header=True, require_single_span=True)
+        if not candidates:
+            candidates = _pick_cells(require_header=True, require_single_span=False)
+    if not candidates:
+        candidates = _pick_cells(require_header=False, require_single_span=True)
+    if not candidates:
+        candidates = _pick_cells(require_header=False, require_single_span=False)
+    if not candidates:
+        return None
+
+    xs0 = sorted(float(pc.bbox[0]) for pc in candidates if pc.bbox)
+    xs1 = sorted(float(pc.bbox[2]) for pc in candidates if pc.bbox)
+    if not xs0 or not xs1:
+        return None
+    mid = len(xs0) // 2
+    x0 = xs0[mid]
+    x1 = xs1[mid]
+    if x1 <= x0:
+        return None
+    return (x0, x1)
+
+
+def _build_sec_col_intervals(
+    t: ParsedTable,
+    *,
+    header_row: int = -1,
+    col_map: Optional[Dict[str, int]] = None,
+) -> Dict[str, Tuple[float, float]]:
+    cm = dict(col_map or {})
+    out: Dict[str, Tuple[float, float]] = {}
+    for key in ("rank", "purpose", "acceptance", "cause", "holder"):
+        if key not in cm:
+            continue
+        try:
+            col_idx = int(cm[key])
+        except Exception:
+            continue
+        if not (0 <= col_idx < t.n_cols):
+            continue
+        interval = _col_interval_from_cells(t, col_idx, header_row=header_row)
+        if interval is not None:
+            out[key] = interval
+    return out
+
+
+def _best_sec_field_for_cell(
+    pc: ParsedCell,
+    intervals: Dict[str, Tuple[float, float]],
+) -> Optional[str]:
+    if not pc.bbox or not intervals:
+        return None
+
+    x0, _y0, x1, _y1 = pc.bbox
+    x_mid = (float(x0) + float(x1)) / 2.0
+    best_key: Optional[str] = None
+    best_score = float("-inf")
+
+    for key, (cx0, cx1) in intervals.items():
+        overlap = max(0.0, min(float(x1), cx1) - max(float(x0), cx0))
+        if overlap > 0:
+            score = overlap
+        else:
+            width = max(1.0, cx1 - cx0)
+            center = (cx0 + cx1) / 2.0
+            score = -abs(x_mid - center) / width
+        if score > best_score:
+            best_score = score
+            best_key = key
+
+    return best_key
+
+
+def _extract_sec_row_fields_from_cells(
+    t: ParsedTable,
+    row_idx: int,
+    *,
+    header_row: int = -1,
+    col_map: Optional[Dict[str, int]] = None,
+) -> Dict[str, str]:
+    intervals = _build_sec_col_intervals(t, header_row=header_row, col_map=col_map)
+    if not intervals:
+        return {}
+
+    row_cells = [pc for pc in t.cells if int(pc.row) == row_idx and (pc.text or "").strip()]
+    if not row_cells:
+        return {}
+
+    row_cells.sort(key=lambda pc: (float(pc.bbox[0]) if pc.bbox else float(int(pc.col)), int(pc.col)))
+    parts: Dict[str, List[str]] = {}
+    for pc in row_cells:
+        key = _best_sec_field_for_cell(pc, intervals)
+        if not key:
+            continue
+        parts.setdefault(key, []).append(pc.text or "")
+
+    return {key: _join_unique_lines(vals) for key, vals in parts.items() if _join_unique_lines(vals)}
+
+
+def _split_acceptance_prefix(text: str) -> Tuple[str, str]:
+    s = _normalize_multiline_text(text)
+    if not s:
+        return "", ""
+    m = SEC_ACCEPTANCE_RE.match(s)
+    if not m:
+        return "", s
+    prefix = _normalize_multiline_text(m.group(1) or "")
+    rest = _normalize_multiline_text(m.group(2) or "")
+    return prefix, rest
+
+
+def _split_cause_prefix(text: str) -> Tuple[str, str]:
+    s = _normalize_multiline_text(text)
+    if not s:
+        return "", ""
+    m = SEC_CAUSE_PREFIX_RE.match(s)
+    if not m:
+        return "", s
+    prefix = _normalize_multiline_text(m.group(1) or "")
+    rest = _normalize_multiline_text(m.group(2) or "")
+    return prefix, rest
+
+
+def _is_acceptance_like(text: str) -> bool:
+    return bool(SEC_ACCEPTANCE_RE.match(_normalize_multiline_text(text)))
+
+
+def _is_cause_like(text: str) -> bool:
+    s = _normalize_multiline_text(text)
+    if not s:
+        return False
+    n = _norm(s)
+    if re.search(SEC_DATE_RE_TEXT, s):
+        return True
+    return any(_norm(k) in n for k in SEC_CAUSE_KEYWORDS)
+
+
+def _is_holder_like(text: str) -> bool:
+    s = _normalize_multiline_text(text)
+    if not s:
+        return False
+    if SEC_HOLDER_MARKER_RE.search(s):
+        return True
+    if SEC_MONEY_MARKER_RE.search(s):
+        return True
+    if SEC_ADDRESS_MARKER_RE.search(s):
+        return True
+    return ("지분" in s) or ("주식회사" in s)
+
+
+def _is_short_holder_label(text: str) -> bool:
+    return _normalize_multiline_text(text) in SEC_SHORT_HOLDER_LABELS
+
+
+def _rebalance_sec_fields(
+    *,
+    purpose: str,
+    acc: str,
+    cause: str,
+    holder: str,
+) -> Tuple[str, str, str, str]:
+    purpose = _normalize_multiline_text(purpose)
+    acc = _normalize_multiline_text(acc)
+    cause = _normalize_multiline_text(cause)
+    holder = _normalize_multiline_text(holder)
+
+    # 등기목적 칸에 접수 문구가 붙은 경우 분리
+    if purpose and (not acc or not _is_acceptance_like(acc)):
+        m = re.search(SEC_DATE_RE_TEXT, purpose)
+        if m and m.start() > 0:
+            purpose_head = _normalize_multiline_text(purpose[:m.start()])
+            purpose_tail = _normalize_multiline_text(purpose[m.start():])
+            tail_acc, tail_rest = _split_acceptance_prefix(purpose_tail)
+            if purpose_head and tail_acc:
+                purpose = purpose_head
+                acc = _append_text(acc, tail_acc)
+                if tail_rest:
+                    cause = _append_text(cause, tail_rest)
+
+    # 접수 칸에 등기원인 일부가 섞인 경우 분리
+    acc_prefix, acc_rest = _split_acceptance_prefix(acc)
+    if acc_prefix:
+        acc = acc_prefix
+        if acc_rest:
+            cause = _append_text(acc_rest, cause)
+
+    # 등기원인 칸 맨 앞에 접수 문구가 들어온 경우 이동
+    if cause and (not acc or not _is_acceptance_like(acc)):
+        moved_acc, cause_rest = _split_acceptance_prefix(cause)
+        if moved_acc:
+            acc = _append_text(acc, moved_acc)
+            cause = cause_rest
+
+    # 권리자 칸 맨 앞에 날짜형 등기원인이 붙은 경우 분리
+    if holder:
+        moved_cause, holder_rest = _split_cause_prefix(holder)
+        if moved_cause and (not cause or not _is_cause_like(cause)):
+            cause = _append_text(cause, moved_cause)
+            holder = holder_rest
+
+    # 등기원인 칸 안에 권리자 정보가 섞였으면 잘라서 이동
+    if cause:
+        marker = SEC_HOLDER_MARKER_RE.search(cause)
+        if marker:
+            left = _normalize_multiline_text(cause[:marker.start()])
+            right = _normalize_multiline_text(cause[marker.start():])
+            if right:
+                if left and _is_cause_like(left):
+                    cause = left
+                    holder = _append_text(right, holder)
+                elif not _is_cause_like(cause):
+                    holder = _append_text(cause, holder)
+                    cause = ""
+        elif _is_holder_like(cause) and not _is_cause_like(cause):
+            holder = _append_text(cause, holder)
+            cause = ""
+
+    # holder가 짧은 라벨만 남고 cause 쪽이 holder 성격이면 전부 holder로 보낸다.
+    if cause and holder and _is_short_holder_label(holder) and _is_holder_like(cause) and not _is_cause_like(cause):
+        holder = _append_text(cause, holder)
+        cause = ""
+
+    return (
+        _normalize_multiline_text(purpose),
+        _normalize_multiline_text(acc),
+        _normalize_multiline_text(cause),
+        _normalize_multiline_text(holder),
+    )
+
+
+def _extract_sec_row_fields(
+    t: ParsedTable,
+    row_idx: int,
+    *,
+    header_row: int = -1,
+    col_map: Optional[Dict[str, int]] = None,
+) -> Dict[str, str]:
+    cm = dict(col_map or {})
+    c_rank = max(0, min(int(cm.get("rank", 0)), t.n_cols - 1))
+    c_purpose = max(0, min(int(cm.get("purpose", min(1, t.n_cols - 1))), t.n_cols - 1))
+    c_acc = max(0, min(int(cm.get("acceptance", min(2, t.n_cols - 1))), t.n_cols - 1))
+    c_cause = max(0, min(int(cm.get("cause", min(3, t.n_cols - 1))), t.n_cols - 1))
+    c_holder = max(0, min(int(cm.get("holder", min(4, t.n_cols - 1))), t.n_cols - 1))
+
+    row = t.grid[row_idx]
+    fields = {
+        "rank": _normalize_multiline_text(row[c_rank] or ""),
+        "purpose": join_cols(row, c_purpose, c_acc, sep="\n") if c_purpose < c_acc else (row[c_purpose] or "").strip(),
+        "acceptance": join_cols(row, c_acc, c_cause, sep="\n") if c_acc < c_cause else (row[c_acc] or "").strip(),
+        "cause": join_cols(row, c_cause, c_holder, sep="\n") if c_cause < c_holder else (row[c_cause] or "").strip(),
+        "holder": join_cols(row, c_holder, t.n_cols, sep="\n"),
+    }
+
+    cell_fields = _extract_sec_row_fields_from_cells(t, row_idx, header_row=header_row, col_map=cm)
+    for key in ("rank", "purpose", "acceptance", "cause", "holder"):
+        val = _normalize_multiline_text(cell_fields.get(key, ""))
+        if val:
+            fields[key] = val
+
+    purpose, acc, cause, holder = _rebalance_sec_fields(
+        purpose=fields.get("purpose", ""),
+        acc=fields.get("acceptance", ""),
+        cause=fields.get("cause", ""),
+        holder=fields.get("holder", ""),
+    )
+    fields["purpose"] = purpose
+    fields["acceptance"] = acc
+    fields["cause"] = cause
+    fields["holder"] = holder
+    return fields
+
+
 # ============================================================
 # 5) 표제부 추출/정리
 # ============================================================
@@ -1077,16 +1481,17 @@ def extract_eul_records_from_table(t: ParsedTable, header_row: int, col_map: Dic
         if all((not (row[c] or "").strip()) for c in range(t.n_cols)):
             continue
 
-        rank = _normalize_rank_text(row[c_rank] or "")
+        row_fields = _extract_sec_row_fields(t, r, header_row=header_row, col_map=col_map)
+        rank = _normalize_rank_text(row_fields.get("rank", ""))
 
         # 잡음/헤더 반복 제거
         if rank and _contains_any(_norm(rank), ["순위번호", "갑구", "을구", "표제부"]):
             continue
 
-        purpose = join_cols(row, c_purpose, c_acc, sep="\n") if c_purpose < c_acc else (row[c_purpose] or "").strip()
-        acc = join_cols(row, c_acc, c_cause, sep="\n") if c_acc < c_cause else (row[c_acc] or "").strip()
-        cause = join_cols(row, c_cause, c_holder, sep="\n") if c_cause < c_holder else (row[c_cause] or "").strip()
-        holder = join_cols(row, c_holder, t.n_cols, sep="\n")
+        purpose = row_fields.get("purpose", "")
+        acc = row_fields.get("acceptance", "")
+        cause = row_fields.get("cause", "")
+        holder = row_fields.get("holder", "")
 
         # 순위번호가 칸 어긋남으로 다른 열/등기목적에 들어온 경우 복구
         if not rank:
@@ -1103,6 +1508,13 @@ def extract_eul_records_from_table(t: ParsedTable, header_row: int, col_map: Dic
             if rank_from_purpose:
                 rank = rank_from_purpose
                 purpose = purpose_rest or purpose
+
+        purpose, acc, cause, holder = _rebalance_sec_fields(
+            purpose=purpose,
+            acc=acc,
+            cause=cause,
+            holder=holder,
+        )
 
         # continuation: 순위번호가 비어있고 내용이 있으면 이전 레코드에 병합
         is_cont = (not rank) and (purpose or acc or cause or holder)
@@ -1539,16 +1951,17 @@ def extract_gab_records_from_table(t: ParsedTable, header_row: int, col_map: Dic
         if all((not (row[c] or "").strip()) for c in range(t.n_cols)):
             continue
 
-        rank = _normalize_rank_text(row[c_rank] or "")
+        row_fields = _extract_sec_row_fields(t, r, header_row=header_row, col_map=col_map)
+        rank = _normalize_rank_text(row_fields.get("rank", ""))
 
         # 잡음/헤더 반복 제거
         if rank and _contains_any(_norm(rank), ["순위번호", "갑구", "을구", "표제부"]):
             continue
 
-        purpose = join_cols(row, c_purpose, c_acc, sep="\n") if c_purpose < c_acc else (row[c_purpose] or "").strip()
-        acc = join_cols(row, c_acc, c_cause, sep="\n") if c_acc < c_cause else (row[c_acc] or "").strip()
-        cause = join_cols(row, c_cause, c_holder, sep="\n") if c_cause < c_holder else (row[c_cause] or "").strip()
-        holder = join_cols(row, c_holder, t.n_cols, sep="\n")
+        purpose = row_fields.get("purpose", "")
+        acc = row_fields.get("acceptance", "")
+        cause = row_fields.get("cause", "")
+        holder = row_fields.get("holder", "")
 
         # 순위번호가 칸 어긋남으로 다른 열/등기목적에 들어온 경우 복구
         if not rank:
@@ -1565,6 +1978,13 @@ def extract_gab_records_from_table(t: ParsedTable, header_row: int, col_map: Dic
             if rank_from_purpose:
                 rank = rank_from_purpose
                 purpose = purpose_rest or purpose
+
+        purpose, acc, cause, holder = _rebalance_sec_fields(
+            purpose=purpose,
+            acc=acc,
+            cause=cause,
+            holder=holder,
+        )
 
         # continuation: 순위번호가 비어있고 내용이 있으면 이전 레코드에 병합
         is_cont = (not rank) and (purpose or acc or cause or holder)
@@ -2241,11 +2661,6 @@ def _recover_rows_from_table_by_missing_mains(
     c_cause = max(0, min(int(cm.get("cause", min(3, t.n_cols - 1))), t.n_cols - 1))
     c_holder = max(0, min(int(cm.get("holder", min(4, t.n_cols - 1))), t.n_cols - 1))
 
-    def _cell_or_join(row: List[str], c0: int, c1: int) -> str:
-        if c0 < c1:
-            return join_cols(row, c0, c1, sep="\n")
-        return (row[c0] or "").strip()
-
     records: List[Dict[str, Any]] = []
     # 결번 복구는 헤더 오판 가능성을 고려해 테이블 전체 스캔
     start_r = 0
@@ -2281,10 +2696,11 @@ def _recover_rows_from_table_by_missing_mains(
         if main_no is None or main_no not in missing_main_set:
             continue
 
-        purpose = _cell_or_join(row, c_purpose, c_acc)
-        acc = _cell_or_join(row, c_acc, c_cause)
-        cause = _cell_or_join(row, c_cause, c_holder)
-        holder = join_cols(row, c_holder, t.n_cols, sep="\n")
+        row_fields = _extract_sec_row_fields(t, r, header_row=header_row, col_map=cm)
+        purpose = row_fields.get("purpose", "")
+        acc = row_fields.get("acceptance", "")
+        cause = row_fields.get("cause", "")
+        holder = row_fields.get("holder", "")
 
         if not purpose:
             purpose = (row[min(1, t.n_cols - 1)] or "").strip()
@@ -2292,6 +2708,13 @@ def _recover_rows_from_table_by_missing_mains(
             acc = (row[min(2, t.n_cols - 1)] or "").strip()
         if not cause and t.n_cols >= 4:
             cause = (row[min(3, t.n_cols - 1)] or "").strip()
+
+        purpose, acc, cause, holder = _rebalance_sec_fields(
+            purpose=purpose,
+            acc=acc,
+            cause=cause,
+            holder=holder,
+        )
 
         ptype = _purpose_type(purpose)
         if section == "을구" and ptype == "gab":
@@ -2332,16 +2755,24 @@ def _recover_rows_from_table_by_missing_mains(
                 if rr < 0 or rr >= t.n_rows:
                     continue
                 row = t.grid[rr]
-                purpose = _cell_or_join(row, c_purpose, c_acc)
-                acc = _cell_or_join(row, c_acc, c_cause)
-                cause = _cell_or_join(row, c_cause, c_holder)
-                holder = join_cols(row, c_holder, t.n_cols, sep="\n")
+                row_fields = _extract_sec_row_fields(t, rr, header_row=header_row, col_map=cm)
+                purpose = row_fields.get("purpose", "")
+                acc = row_fields.get("acceptance", "")
+                cause = row_fields.get("cause", "")
+                holder = row_fields.get("holder", "")
                 if not purpose:
                     purpose = (row[min(1, t.n_cols - 1)] or "").strip()
                 if not acc and t.n_cols >= 3:
                     acc = (row[min(2, t.n_cols - 1)] or "").strip()
                 if not cause and t.n_cols >= 4:
                     cause = (row[min(3, t.n_cols - 1)] or "").strip()
+
+                purpose, acc, cause, holder = _rebalance_sec_fields(
+                    purpose=purpose,
+                    acc=acc,
+                    cause=cause,
+                    holder=holder,
+                )
 
                 ptype = _purpose_type(purpose)
                 if section == "을구" and ptype == "gab":
@@ -2501,6 +2932,13 @@ def _recover_rows_from_cells_by_missing_mains(
         if not cause and t.n_cols >= 4:
             cause = (row[min(3, t.n_cols - 1)] or "").strip()
 
+        purpose, acc, cause, holder = _rebalance_sec_fields(
+            purpose=purpose,
+            acc=acc,
+            cause=cause,
+            holder=holder,
+        )
+
         ptype = _purpose_type(" ".join([purpose, holder]).strip())
         if section == "을구" and ptype == "gab":
             continue
@@ -2532,7 +2970,7 @@ def _extract_date_phrases(text: str) -> List[str]:
         return []
     # 예: 2005년5월20일 제65032호 / 2005년5월20일 해지
     pat = re.compile(
-        r"\d{4}\s*년\s*\d{1,2}\s*월\s*\d{1,2}\s*일(?:\s*(?:제\s*)?\d+\s*호)?(?:\s*(?:해지|설정계약|변경|말소|상호변경))?"
+        rf"{SEC_DATE_RE_TEXT}(?:\s*(?:제\s*)?\d+\s*호)?(?:\s*{SEC_CAUSE_ACTION_RE_TEXT})?"
     )
     out = [re.sub(r"\s+", " ", m.group(0)).strip() for m in pat.finditer(text)]
     # 순서 유지 unique
@@ -2649,6 +3087,13 @@ def _recover_rows_from_page_lines_by_missing_mains(
             if cause:
                 holder = holder.replace(cause, "", 1).strip()
             holder = re.sub(r"\n{2,}", "\n", holder).strip()
+
+            purpose, acc, cause, holder = _rebalance_sec_fields(
+                purpose=purpose,
+                acc=acc,
+                cause=cause,
+                holder=holder,
+            )
 
             ptype = _purpose_type(purpose + " " + holder)
             if section == "을구" and ptype == "gab":
