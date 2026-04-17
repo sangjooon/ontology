@@ -50,7 +50,7 @@ from openpyxl.utils import get_column_letter
 # 0) 앱 설정
 # ============================================================
 APP_TITLE = "DOVI 📄 dev — 토지 등기(표제부+갑구+을구) 정리"
-APP_VERSION = "v0.7.0"
+APP_VERSION = "v0.7.1"
 
 DEFAULT_PASSWORD = "alohomora"  # 데모용
 MAX_PAGES_PER_REQUEST = 10      # Naver General OCR PDF 최대 10페이지/요청
@@ -654,7 +654,7 @@ SEC_CAUSE_PREFIX_RE = re.compile(
     re.S,
 )
 SEC_HOLDER_MARKER_RE = re.compile(
-    r"(채권최고액|근저당권자|저당권자|전세권자|지상권자|가등기권자|권리자|공유자|소유자|채무자|목적|성명|주소|주식회사|지분)"
+    r"(채권최고액|근저당권자|저당권자|채권자|전세권자|지상권자|임차권자|가등기권자|권리자|공유자|소유자|채무자|목적|성명|주소|주식회사|지분|공동담보|전세금|존속기간|범위|공장및광업재단)"
 )
 SEC_SHORT_HOLDER_LABELS = {
     "목적",
@@ -664,6 +664,11 @@ SEC_SHORT_HOLDER_LABELS = {
     "권리자",
     "공유자",
     "소유자",
+    "채권자",
+    "공동담보",
+    "전세금",
+    "존속기간",
+    "범위",
 }
 SEC_CAUSE_KEYWORDS = [
     "매매",
@@ -702,6 +707,7 @@ SUMMARY_MARKERS = [
     "이 등기기록은 현행 유효한 사항만",
 ]
 
+
 def _table_y0(t: ParsedTable) -> float:
     if t.bbox:
         return float(t.bbox[1])
@@ -715,7 +721,6 @@ def _looks_like_summary_text(text: str) -> bool:
 
 
 def _is_summary_table_context(t: ParsedTable, page_lines: List[PageLine]) -> bool:
-    # 1) 테이블 상단 자체에서 탐지
     head = "\n".join(
         " ".join((x or "").strip() for x in t.grid[r] if (x or "").strip())
         for r in range(min(t.n_rows, 8))
@@ -723,7 +728,6 @@ def _is_summary_table_context(t: ParsedTable, page_lines: List[PageLine]) -> boo
     if _looks_like_summary_text(head):
         return True
 
-    # 2) 테이블 바로 위 일반 OCR 텍스트에서 탐지
     y0 = _table_y0(t)
     nearby_lines = []
     for ln in page_lines:
@@ -735,6 +739,7 @@ def _is_summary_table_context(t: ParsedTable, page_lines: List[PageLine]) -> boo
         return True
 
     return False
+
 
 def _normalize_multiline_text(text: str) -> str:
     s = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
@@ -944,6 +949,23 @@ def _is_short_holder_label(text: str) -> bool:
     return _normalize_multiline_text(text) in SEC_SHORT_HOLDER_LABELS
 
 
+def _holder_quality_score(text: str) -> int:
+    s = _normalize_multiline_text(text)
+    if not s:
+        return 0
+
+    score = len(s)
+    if SEC_HOLDER_MARKER_RE.search(s):
+        score += 20
+    if SEC_MONEY_MARKER_RE.search(s):
+        score += 15
+    if SEC_ADDRESS_MARKER_RE.search(s):
+        score += 10
+    if "\n" in s:
+        score += 5
+    return score
+
+
 def _rebalance_sec_fields(
     *,
     purpose: str,
@@ -1044,10 +1066,40 @@ def _extract_sec_row_fields(
     }
 
     cell_fields = _extract_sec_row_fields_from_cells(t, row_idx, header_row=header_row, col_map=cm)
+
     for key in ("rank", "purpose", "acceptance", "cause", "holder"):
         val = _normalize_multiline_text(cell_fields.get(key, ""))
-        if val:
-            fields[key] = val
+        if not val:
+            continue
+
+        if key == "rank":
+            if _normalize_rank_text(val):
+                fields["rank"] = val
+            continue
+
+        if key == "acceptance":
+            if _is_acceptance_like(val) or not fields["acceptance"]:
+                fields["acceptance"] = val
+            continue
+
+        if key == "cause":
+            if _is_holder_like(val) and not _is_cause_like(val):
+                fields["holder"] = _append_text(fields.get("holder", ""), val)
+            elif _is_cause_like(val) or len(val) > len(fields.get("cause", "")):
+                fields["cause"] = val
+            continue
+
+        if key == "holder":
+            base = fields.get("holder", "")
+            if _holder_quality_score(val) >= _holder_quality_score(base):
+                fields["holder"] = _append_text(base, val)
+            else:
+                fields["holder"] = _append_text(val, base)
+            continue
+
+        # purpose
+        if len(val) > len(fields.get("purpose", "")):
+            fields["purpose"] = val
 
     purpose, acc, cause, holder = _rebalance_sec_fields(
         purpose=fields.get("purpose", ""),
@@ -2680,6 +2732,61 @@ def _sort_sec_df_by_rank(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _sec_row_quality(row: pd.Series) -> int:
+    score = 0
+
+    for col, w in [
+        ("등기목적", 8),
+        ("접수", 6),
+        ("등기원인", 8),
+        ("권리자 및 기타사항", 20),
+    ]:
+        txt = _normalize_multiline_text(row.get(col, ""))
+        if txt:
+            score += len(txt) + w
+
+    holder = _normalize_multiline_text(row.get("권리자 및 기타사항", ""))
+    if SEC_HOLDER_MARKER_RE.search(holder):
+        score += 20
+    if SEC_MONEY_MARKER_RE.search(holder):
+        score += 15
+
+    return score
+
+
+def _dedupe_eul_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    work = df.copy()
+    if "순위번호" not in work.columns:
+        return work
+
+    if "등기목적" not in work.columns:
+        work["등기목적"] = ""
+
+    work["_dup_key"] = (
+        work["순위번호"].astype(str).str.strip()
+        + "||"
+        + work["등기목적"].fillna("").astype(str).map(_norm)
+    )
+    work["_score"] = work.apply(_sec_row_quality, axis=1)
+    if "페이지" in work.columns:
+        work["_page"] = pd.to_numeric(work["페이지"], errors="coerce").fillna(10**9)
+    else:
+        work["_page"] = 10**9
+
+    work = work.sort_values(
+        ["_dup_key", "_score", "_page"],
+        ascending=[True, False, True]
+    )
+
+    work = work.drop_duplicates(subset=["_dup_key"], keep="first")
+    work = work.drop(columns=["_dup_key", "_score", "_page"], errors="ignore")
+    work = _sort_sec_df_by_rank(work)
+    return work
+
+
 def _recover_rows_from_table_by_missing_mains(
     t: ParsedTable,
     missing_main_set: set,
@@ -3527,6 +3634,8 @@ def process_pdf(
     section_hint_by_table: Dict[str, str] = {}
 
     for (t, header_row, col_map) in sec_candidates:
+        sec_colmap_by_id[t.table_id] = {"header_row": header_row, "col_map": dict(col_map)}
+
         if _is_summary_table_context(t, all_page_lines.get(t.page_no, [])):
             section_hint_by_table[t.table_id] = "summary"
             if debug:
@@ -3538,7 +3647,7 @@ def process_pdf(
                     }
                 )
             continue
-        sec_colmap_by_id[t.table_id] = {"header_row": header_row, "col_map": dict(col_map)}
+
         # 1차: 페이지 라벨(갑구/을구) 기반 분류
         section_by_label = classify_gab_or_eul(t, all_page_lines.get(t.page_no, []))
         section_by_kw = guess_section_by_purpose_keywords(t, header_row, col_map)
@@ -3640,6 +3749,7 @@ def process_pdf(
         edfs = eul_df_by_group.get(g.key) or []
         if edfs:
             eul_df = pd.concat(edfs, ignore_index=True).drop_duplicates()
+            eul_df = _dedupe_eul_df(eul_df)
             cols = ["페이지", "table_id", "순위번호", "등기목적", "접수", "등기원인", "권리자 및 기타사항"]
             g.eul_df = eul_df[[c for c in cols if c in eul_df.columns]]
         else:
@@ -3676,7 +3786,7 @@ def process_pdf(
             guessed_lot = lot_guess_by_table.get(t.table_id, "")
             page_match = g.start_page <= t.page_no <= g.end_page
             lot_match = group_has_lot_key and guessed_lot == group_lot_key
-
+            # page range 안의 테이블은 항상 보되, 지번 추정이 맞는 테이블은 범위 밖이어도 보조 후보로 포함
             if page_match or lot_match:
                 cand_tables.append(t)
         cand_tables.sort(key=lambda t: (int(t.page_no), float(t.bbox[1]) if t.bbox else 0.0, str(t.table_id)))
@@ -3794,6 +3904,7 @@ def process_pdf(
         if recovered_parts:
             base = g.eul_df if isinstance(g.eul_df, pd.DataFrame) else pd.DataFrame()
             merged = pd.concat([base] + recovered_parts, ignore_index=True).drop_duplicates()
+            merged = _dedupe_eul_df(merged)
             merged = _sort_sec_df_by_rank(merged)
             cols = ["페이지", "table_id", "순위번호", "등기목적", "접수", "등기원인", "권리자 및 기타사항"]
             g.eul_df = merged[[c for c in cols if c in merged.columns]]
