@@ -50,7 +50,7 @@ from openpyxl.utils import get_column_letter
 # 0) 앱 설정
 # ============================================================
 APP_TITLE = "DOVI 📄 dev — 토지 등기(표제부+갑구+을구) 정리"
-APP_VERSION = "v0.7.1"
+APP_VERSION = "v0.7.2"
 
 DEFAULT_PASSWORD = "alohomora"  # 데모용
 MAX_PAGES_PER_REQUEST = 10      # Naver General OCR PDF 최대 10페이지/요청
@@ -922,21 +922,61 @@ def _is_acceptance_like(text: str) -> bool:
     return bool(SEC_ACCEPTANCE_RE.match(_normalize_multiline_text(text)))
 
 
-def _is_cause_like(text: str) -> bool:
+GAB_HOLDER_MARKER_RE = re.compile(
+    r"(소유자|공유자|지분|성명|주소|주식회사|주민등록번호)"
+)
+EUL_HOLDER_MARKER_RE = re.compile(
+    r"(채권최고액|근저당권자|저당권자|채권자|채무자|공동담보|전세금|존속기간|범위|목록|공장및광업재단|전세권자|지상권자|임차권자|질권자|가등기권자)"
+)
+GAB_CAUSE_KEYWORDS = SEC_CAUSE_KEYWORDS + [
+    "매매", "증여", "상속", "협의분할", "판결", "공매", "신탁", "해제",
+]
+EUL_CAUSE_KEYWORDS = SEC_CAUSE_KEYWORDS + [
+    "설정계약", "변경계약", "경정", "일부이전", "이전", "말소", "해지", "존속기간", "범위", "부기", "갱신",
+]
+
+
+def _section_key(section: str) -> str:
+    n = _norm(section or "")
+    if "을구" in n or n == "eul":
+        return "eul"
+    if "갑구" in n or n == "gab":
+        return "gab"
+    return "common"
+
+
+def _is_cause_like(text: str, *, section: str = "common") -> bool:
     s = _normalize_multiline_text(text)
     if not s:
         return False
     n = _norm(s)
     if re.search(SEC_DATE_RE_TEXT, s):
         return True
-    return any(_norm(k) in n for k in SEC_CAUSE_KEYWORDS)
+
+    sk = _section_key(section)
+    if sk == "eul":
+        keywords = EUL_CAUSE_KEYWORDS
+    elif sk == "gab":
+        keywords = GAB_CAUSE_KEYWORDS
+    else:
+        keywords = SEC_CAUSE_KEYWORDS
+
+    return any(_norm(k) in n for k in keywords)
 
 
-def _is_holder_like(text: str) -> bool:
+def _is_holder_like(text: str, *, section: str = "common") -> bool:
     s = _normalize_multiline_text(text)
     if not s:
         return False
-    if SEC_HOLDER_MARKER_RE.search(s):
+
+    marker_re = SEC_HOLDER_MARKER_RE
+    sk = _section_key(section)
+    if sk == "eul":
+        marker_re = EUL_HOLDER_MARKER_RE
+    elif sk == "gab":
+        marker_re = GAB_HOLDER_MARKER_RE
+
+    if marker_re.search(s) or SEC_HOLDER_MARKER_RE.search(s):
         return True
     if SEC_MONEY_MARKER_RE.search(s):
         return True
@@ -949,13 +989,21 @@ def _is_short_holder_label(text: str) -> bool:
     return _normalize_multiline_text(text) in SEC_SHORT_HOLDER_LABELS
 
 
-def _holder_quality_score(text: str) -> int:
+def _holder_quality_score(text: str, *, section: str = "common") -> int:
     s = _normalize_multiline_text(text)
     if not s:
         return 0
 
     score = len(s)
-    if SEC_HOLDER_MARKER_RE.search(s):
+
+    sk = _section_key(section)
+    marker_re = SEC_HOLDER_MARKER_RE
+    if sk == "eul":
+        marker_re = EUL_HOLDER_MARKER_RE
+    elif sk == "gab":
+        marker_re = GAB_HOLDER_MARKER_RE
+
+    if marker_re.search(s) or SEC_HOLDER_MARKER_RE.search(s):
         score += 20
     if SEC_MONEY_MARKER_RE.search(s):
         score += 15
@@ -972,6 +1020,7 @@ def _rebalance_sec_fields(
     acc: str,
     cause: str,
     holder: str,
+    section: str = "common",
 ) -> Tuple[str, str, str, str]:
     purpose = _normalize_multiline_text(purpose)
     acc = _normalize_multiline_text(acc)
@@ -1008,7 +1057,7 @@ def _rebalance_sec_fields(
     # 권리자 칸 맨 앞에 날짜형 등기원인이 붙은 경우 분리
     if holder:
         moved_cause, holder_rest = _split_cause_prefix(holder)
-        if moved_cause and (not cause or not _is_cause_like(cause)):
+        if moved_cause and (not cause or not _is_cause_like(cause, section=section)):
             cause = _append_text(cause, moved_cause)
             holder = holder_rest
 
@@ -1019,18 +1068,18 @@ def _rebalance_sec_fields(
             left = _normalize_multiline_text(cause[:marker.start()])
             right = _normalize_multiline_text(cause[marker.start():])
             if right:
-                if left and _is_cause_like(left):
+                if left and _is_cause_like(left, section=section):
                     cause = left
                     holder = _append_text(right, holder)
-                elif not _is_cause_like(cause):
+                elif not _is_cause_like(cause, section=section):
                     holder = _append_text(cause, holder)
                     cause = ""
-        elif _is_holder_like(cause) and not _is_cause_like(cause):
+        elif _is_holder_like(cause, section=section) and not _is_cause_like(cause, section=section):
             holder = _append_text(cause, holder)
             cause = ""
 
     # holder가 짧은 라벨만 남고 cause 쪽이 holder 성격이면 전부 holder로 보낸다.
-    if cause and holder and _is_short_holder_label(holder) and _is_holder_like(cause) and not _is_cause_like(cause):
+    if cause and holder and _is_short_holder_label(holder) and _is_holder_like(cause, section=section) and not _is_cause_like(cause, section=section):
         holder = _append_text(cause, holder)
         cause = ""
 
@@ -1048,6 +1097,7 @@ def _extract_sec_row_fields(
     *,
     header_row: int = -1,
     col_map: Optional[Dict[str, int]] = None,
+    section: str = "common",
 ) -> Dict[str, str]:
     cm = dict(col_map or {})
     c_rank = max(0, min(int(cm.get("rank", 0)), t.n_cols - 1))
@@ -1083,15 +1133,15 @@ def _extract_sec_row_fields(
             continue
 
         if key == "cause":
-            if _is_holder_like(val) and not _is_cause_like(val):
+            if _is_holder_like(val, section=section) and not _is_cause_like(val, section=section):
                 fields["holder"] = _append_text(fields.get("holder", ""), val)
-            elif _is_cause_like(val) or len(val) > len(fields.get("cause", "")):
+            elif _is_cause_like(val, section=section) or len(val) > len(fields.get("cause", "")):
                 fields["cause"] = val
             continue
 
         if key == "holder":
             base = fields.get("holder", "")
-            if _holder_quality_score(val) >= _holder_quality_score(base):
+            if _holder_quality_score(val, section=section) >= _holder_quality_score(base, section=section):
                 fields["holder"] = _append_text(base, val)
             else:
                 fields["holder"] = _append_text(val, base)
@@ -1576,7 +1626,7 @@ def extract_eul_records_from_table(t: ParsedTable, header_row: int, col_map: Dic
         if all((not (row[c] or "").strip()) for c in range(t.n_cols)):
             continue
 
-        row_fields = _extract_sec_row_fields(t, r, header_row=header_row, col_map=col_map)
+        row_fields = _extract_sec_row_fields(t, r, header_row=header_row, col_map=col_map, section="eul")
         rank = _normalize_rank_text(row_fields.get("rank", ""))
 
         # 잡음/헤더 반복 제거
@@ -1609,6 +1659,7 @@ def extract_eul_records_from_table(t: ParsedTable, header_row: int, col_map: Dic
             acc=acc,
             cause=cause,
             holder=holder,
+            section="eul",
         )
 
         # continuation: 순위번호가 비어있고 내용이 있으면 이전 레코드에 병합
@@ -1692,6 +1743,117 @@ GAB_ONTOLOGY: Dict[str, Dict[str, Any]] = {
         "aliases": ["권리자및기타사항", "권리자 및 기타사항", "권리자및 기타사항", "권리자 및기타사항", "권리자 및 기타 사항"],
     },
 }
+
+
+EUL_ONTOLOGY: Dict[str, Dict[str, Any]] = {
+    "rank": {
+        "label": "순위번호",
+        "aliases": ["순위번호", "순위 번호", "순 위 번 호", "순위", "순위No", "순위NO"],
+    },
+    "purpose": {
+        "label": "등기목적",
+        "aliases": ["등기목적", "등기 목적", "등 기 목 적", "목적"],
+    },
+    "acceptance": {
+        "label": "접수",
+        "aliases": ["접수", "접 수", "접수일자", "접수번호"],
+    },
+    "cause": {
+        "label": "등기원인",
+        "aliases": ["등기원인", "등기 원인", "등 기 원 인", "원인"],
+    },
+    "holder": {
+        "label": "권리자 및 기타사항",
+        "aliases": [
+            "권리자및기타사항",
+            "권리자 및 기타사항",
+            "권리자및 기타사항",
+            "권리자 및기타사항",
+            "권리자 및 기타 사항",
+            "권리자",
+            "기타사항",
+            "기타 사항",
+        ],
+    },
+}
+
+
+def _section_ontology(section: str) -> Dict[str, Dict[str, Any]]:
+    return EUL_ONTOLOGY if _section_key(section) == "eul" else GAB_ONTOLOGY
+
+
+def _remap_sec_col_map_with_ontology(
+    t: ParsedTable,
+    header_row: int,
+    col_map: Dict[str, int],
+    *,
+    section: str,
+) -> Dict[str, int]:
+    cm = dict(col_map or {})
+    ontology = _section_ontology(section)
+
+    if 0 <= header_row < t.n_rows:
+        for c in range(t.n_cols):
+            cell_norm = _norm(t.grid[header_row][c])
+            if not cell_norm:
+                continue
+            for key in ("rank", "purpose", "acceptance", "cause", "holder"):
+                aliases = ontology.get(key, {}).get("aliases", [])
+                if aliases and _contains_any(cell_norm, aliases):
+                    cm[key] = c
+                    break
+
+    if _section_key(section) == "eul":
+        holder_scores: Dict[int, float] = {}
+        cause_scores: Dict[int, float] = {}
+        start_row = max(header_row + 1, 0)
+        end_row = min(t.n_rows, start_row + 20)
+
+        for r in range(start_row, end_row):
+            row = t.grid[r]
+            for c, raw in enumerate(row):
+                txt = _normalize_multiline_text(raw)
+                if not txt:
+                    continue
+                if _is_holder_like(txt, section="eul"):
+                    holder_scores[c] = holder_scores.get(c, 0.0) + 3.0 + min(len(txt), 80) / 40.0
+                if _is_cause_like(txt, section="eul"):
+                    cause_scores[c] = cause_scores.get(c, 0.0) + 2.0 + min(len(txt), 60) / 60.0
+
+        if holder_scores:
+            best_holder = max(holder_scores, key=lambda c: (holder_scores[c], c))
+            cm["holder"] = max(best_holder, cm.get("holder", best_holder))
+
+        if cause_scores:
+            holder_col = cm.get("holder", t.n_cols - 1)
+            valid = [c for c in cause_scores if c < holder_col]
+            best_cause = max(valid or list(cause_scores.keys()), key=lambda c: (cause_scores[c], c))
+            cm["cause"] = min(best_cause, holder_col)
+
+        cm.setdefault("rank", 0)
+        cm.setdefault("purpose", 1)
+        cm.setdefault("acceptance", min(2, t.n_cols - 1))
+        cm.setdefault("cause", min(3, t.n_cols - 1))
+        cm.setdefault("holder", min(4, t.n_cols - 1))
+
+        if not (cm["rank"] <= cm["purpose"] <= cm["acceptance"] <= cm["cause"] <= cm["holder"]):
+            ordered = sorted(
+                [
+                    ("rank", cm["rank"]),
+                    ("purpose", cm["purpose"]),
+                    ("acceptance", cm["acceptance"]),
+                    ("cause", cm["cause"]),
+                    ("holder", cm["holder"]),
+                ],
+                key=lambda x: x[1],
+            )
+            cm["rank"] = ordered[0][1]
+            cm["purpose"] = ordered[1][1]
+            cm["acceptance"] = ordered[2][1]
+            cm["cause"] = ordered[3][1]
+            cm["holder"] = ordered[4][1]
+
+    return cm
 
 
 def classify_gab_or_eul(table: ParsedTable, page_lines: List[PageLine]) -> str:
@@ -2046,7 +2208,7 @@ def extract_gab_records_from_table(t: ParsedTable, header_row: int, col_map: Dic
         if all((not (row[c] or "").strip()) for c in range(t.n_cols)):
             continue
 
-        row_fields = _extract_sec_row_fields(t, r, header_row=header_row, col_map=col_map)
+        row_fields = _extract_sec_row_fields(t, r, header_row=header_row, col_map=col_map, section="gab")
         rank = _normalize_rank_text(row_fields.get("rank", ""))
 
         # 잡음/헤더 반복 제거
@@ -2079,6 +2241,7 @@ def extract_gab_records_from_table(t: ParsedTable, header_row: int, col_map: Dic
             acc=acc,
             cause=cause,
             holder=holder,
+            section="gab",
         )
 
         # continuation: 순위번호가 비어있고 내용이 있으면 이전 레코드에 병합
@@ -2846,7 +3009,7 @@ def _recover_rows_from_table_by_missing_mains(
         if main_no is None or main_no not in missing_main_set:
             continue
 
-        row_fields = _extract_sec_row_fields(t, r, header_row=header_row, col_map=cm)
+        row_fields = _extract_sec_row_fields(t, r, header_row=header_row, col_map=cm, section=section)
         purpose = row_fields.get("purpose", "")
         acc = row_fields.get("acceptance", "")
         cause = row_fields.get("cause", "")
@@ -2864,6 +3027,7 @@ def _recover_rows_from_table_by_missing_mains(
             acc=acc,
             cause=cause,
             holder=holder,
+            section=section,
         )
 
         ptype = _purpose_type(purpose)
@@ -2905,7 +3069,7 @@ def _recover_rows_from_table_by_missing_mains(
                 if rr < 0 or rr >= t.n_rows:
                     continue
                 row = t.grid[rr]
-                row_fields = _extract_sec_row_fields(t, rr, header_row=header_row, col_map=cm)
+                row_fields = _extract_sec_row_fields(t, rr, header_row=header_row, col_map=cm, section=section)
                 purpose = row_fields.get("purpose", "")
                 acc = row_fields.get("acceptance", "")
                 cause = row_fields.get("cause", "")
@@ -3087,6 +3251,7 @@ def _recover_rows_from_cells_by_missing_mains(
             acc=acc,
             cause=cause,
             holder=holder,
+            section=section,
         )
 
         ptype = _purpose_type(" ".join([purpose, holder]).strip())
@@ -3634,8 +3799,6 @@ def process_pdf(
     section_hint_by_table: Dict[str, str] = {}
 
     for (t, header_row, col_map) in sec_candidates:
-        sec_colmap_by_id[t.table_id] = {"header_row": header_row, "col_map": dict(col_map)}
-
         if _is_summary_table_context(t, all_page_lines.get(t.page_no, [])):
             section_hint_by_table[t.table_id] = "summary"
             if debug:
@@ -3662,6 +3825,10 @@ def process_pdf(
         if section_by_label in ("갑구", "을구"):
             section = section_by_label
         section_hint_by_table[t.table_id] = section
+
+        if section in ("갑구", "을구"):
+            col_map = _remap_sec_col_map_with_ontology(t, header_row, col_map, section=section)
+            sec_colmap_by_id[t.table_id] = {"header_row": header_row, "col_map": dict(col_map), "section": section}
 
         if section not in ("갑구", "을구"):
             if debug:
