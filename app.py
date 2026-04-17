@@ -692,6 +692,49 @@ SEC_ADDRESS_MARKER_RE = re.compile(
 )
 SEC_MONEY_MARKER_RE = re.compile(r"금\s*[\d,]+원")
 
+SUMMARY_MARKERS = [
+    "주요 등기사항 요약",
+    "주요등기사항요약",
+    "주요 등기사항요약",
+    "등기사항 요약",
+    "등기사항요약",
+    "말소사항을 포함한 주요 등기사항 요약",
+    "이 등기기록은 현행 유효한 사항만",
+]
+
+def _table_y0(t: ParsedTable) -> float:
+    if t.bbox:
+        return float(t.bbox[1])
+    ys = [float(c.bbox[1]) for c in t.cells if c.bbox]
+    return min(ys) if ys else 0.0
+
+
+def _looks_like_summary_text(text: str) -> bool:
+    n = _norm(text)
+    return any(_norm(m) in n for m in SUMMARY_MARKERS)
+
+
+def _is_summary_table_context(t: ParsedTable, page_lines: List[PageLine]) -> bool:
+    # 1) 테이블 상단 자체에서 탐지
+    head = "\n".join(
+        " ".join((x or "").strip() for x in t.grid[r] if (x or "").strip())
+        for r in range(min(t.n_rows, 8))
+    )
+    if _looks_like_summary_text(head):
+        return True
+
+    # 2) 테이블 바로 위 일반 OCR 텍스트에서 탐지
+    y0 = _table_y0(t)
+    nearby_lines = []
+    for ln in page_lines:
+        if ln.y < y0 and (y0 - ln.y) <= 700:
+            nearby_lines.append(ln.text)
+
+    nearby_text = "\n".join(nearby_lines[-5:])
+    if _looks_like_summary_text(nearby_text):
+        return True
+
+    return False
 
 def _normalize_multiline_text(text: str) -> str:
     s = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
@@ -3484,6 +3527,17 @@ def process_pdf(
     section_hint_by_table: Dict[str, str] = {}
 
     for (t, header_row, col_map) in sec_candidates:
+        if _is_summary_table_context(t, all_page_lines.get(t.page_no, [])):
+            section_hint_by_table[t.table_id] = "summary"
+            if debug:
+                debug_info["section_skipped_tables"].append(
+                    {
+                        "page": t.page_no,
+                        "table_id": t.table_id,
+                        "reason": "summary_table",
+                    }
+                )
+            continue
         sec_colmap_by_id[t.table_id] = {"header_row": header_row, "col_map": dict(col_map)}
         # 1차: 페이지 라벨(갑구/을구) 기반 분류
         section_by_label = classify_gab_or_eul(t, all_page_lines.get(t.page_no, []))
@@ -3616,10 +3670,13 @@ def process_pdf(
         group_has_lot_key = _is_probable_lot_key(group_lot_key)
         cand_tables = []
         for t in tables_for_registry:
+            if _is_summary_table_context(t, all_page_lines.get(t.page_no, [])):
+                continue
+
             guessed_lot = lot_guess_by_table.get(t.table_id, "")
             page_match = g.start_page <= t.page_no <= g.end_page
             lot_match = group_has_lot_key and guessed_lot == group_lot_key
-            # page range 안의 테이블은 항상 보되, 지번 추정이 맞는 테이블은 범위 밖이어도 보조 후보로 포함
+
             if page_match or lot_match:
                 cand_tables.append(t)
         cand_tables.sort(key=lambda t: (int(t.page_no), float(t.bbox[1]) if t.bbox else 0.0, str(t.table_id)))
